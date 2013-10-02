@@ -12,7 +12,8 @@ AC_CANONICAL_SYSTEM
 
 AC_USE_SYSTEM_EXTENSIONS
 
-AM_INIT_AUTOMAKE([foreign])
+AM_INIT_AUTOMAKE([1.11 foreign silent-rules])
+AM_SILENT_RULES([yes])
 
 dnl Checks for programs.
 AC_PROG_AWK
@@ -110,7 +111,7 @@ dnl
 dnl mapi top-relative paths: defined here so mapi can be used elsewhere
 dnl
 
-AC_SUBST([MAPI_PREFIX], [src/GLdispatch/mapi])
+AC_SUBST([MAPI_PREFIX], [src/GLdispatch/vnd-glapi/mapi])
 AC_SUBST([MAPI_MESA_PREFIX], [src/GLdispatch/mesa])
 
 AM_CONDITIONAL(HAVE_X86_ASM, echo "$DEFINES" | grep 'X86_ASM' >/dev/null 2>&1)
@@ -167,10 +168,7 @@ AC_CONFIG_FILES([Makefile
                  src/GLX/Makefile
                  src/x11glvnd/Makefile
                  src/GLdispatch/Makefile
-                 src/GLdispatch/mapi/Makefile
-                 src/GLdispatch/mapi/glapi/Makefile
-                 src/GLdispatch/mapi/glapi/gen/Makefile
-                 src/GLdispatch/mapi/vnd-glapi/Makefile
+                 src/GLdispatch/vnd-glapi/Makefile
                  src/util/Makefile
                  src/util/glvnd_pthread/Makefile
                  src/util/trace/Makefile

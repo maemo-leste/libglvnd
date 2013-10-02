@@ -25,14 +25,18 @@
 # TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 # MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
 
+noinst_HEADERS = \
+	GLdispatch.h \
+	GLdispatchPrivate.h
+
 lib_LTLIBRARIES = libGLdispatch.la
 
-SUBDIRS = mapi/vnd-glapi
+SUBDIRS = vnd-glapi
 
-libGLdispatch_la_CFLAGS =  -I$(srcdir)/mapi/glapi
+libGLdispatch_la_CFLAGS =  -I$(srcdir)/vnd-glapi/mapi/glapi
 libGLdispatch_la_CFLAGS += -I$(top_srcdir)/src/util/trace
 libGLdispatch_la_CFLAGS += -I$(top_srcdir)/src/util/glvnd_pthread
-libGLdispatch_la_CFLAGS += -I$(srcdir)/mapi
+libGLdispatch_la_CFLAGS += -I$(srcdir)/vnd-glapi/mapi
 libGLdispatch_la_CFLAGS += -I$(top_srcdir)/include
 
 libGLdispatch_la_LDFLAGS = -shared
@@ -40,5 +44,5 @@ libGLdispatch_la_LDFLAGS = -shared
 libGLdispatch_la_SOURCES = \
 	GLdispatch.c
 
-libGLdispatch_la_LIBADD = mapi/vnd-glapi/libglapi.la
+libGLdispatch_la_LIBADD = vnd-glapi/libglapi.la
 libGLdispatch_la_LIBADD += ../util/trace/libtrace.la

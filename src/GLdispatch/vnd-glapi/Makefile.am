@@ -1,8 +1,10 @@
 # Used by OpenGL vendor-neutral dispatch library
 
+EXTRA_DIST = mapi
+
 TOP = $(top_srcdir)
 GLAPI = $(top_srcdir)/$(MAPI_PREFIX)/glapi
-include $(srcdir)/../Makefile.sources
+include $(srcdir)/mapi/Makefile.sources
 
 noinst_LTLIBRARIES = libglapi.la
 
@@ -34,4 +36,4 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/$(MAPI_PREFIX)/glapi \
 	-I$(top_srcdir)/$(MAPI_MESA_PREFIX) \
 	-DMAPI_MODE_GLAPI \
-	-DMAPI_ABI_HEADER=\"vnd-glapi/glapi_mapi_tmp.h\"
+	-DMAPI_ABI_HEADER=\"$(builddir)/glapi_mapi_tmp.h\"
