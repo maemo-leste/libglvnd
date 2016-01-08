@@ -27,23 +27,55 @@
 
 lib_LTLIBRARIES = libGL.la
 
-libGL_la_SOURCES = \
-	GL.c           \
-	glapitemp.h
+TOP = $(top_srcdir)
+MAPI = $(top_srcdir)/$(MAPI_PREFIX)
+GLAPI = $(MAPI)/glapi
 
-BUILT_SOURCES = glapitemp.h
+noinst_HEADERS =        \
+	libgl.h             \
+	g_glapi_mapi_gl_tmp.h
+
+include $(top_srcdir)/src/GLdispatch/vnd-glapi/entry_files.mk
+
+libGL_la_SOURCES =      \
+	libgl.c             \
+	$(MAPI_GLDISPATCH_ENTRY_FILES) \
+	$(MAPI)/stub.c      \
+	g_libglglxwrapper.c \
+	$(top_srcdir)/src/util/utils_misc.c
+
+BUILT_SOURCES = g_glapi_mapi_gl_tmp.h g_libglglxwrapper.c
 CLEANFILES = $(BUILT_SOURCES)
 
-TOP = $(top_srcdir)
-GLAPI = $(top_srcdir)/$(MAPI_PREFIX)/glapi
-include $(GLAPI)/gen/glapi_gen.mk
+include $(top_srcdir)/src/generate/glvnd_gen.mk
+g_glapi_mapi_gl_tmp.h : $(glapi_gen_mapi_deps)
+	$(call glapi_gen_mapi, gl)
 
-glapitemp.h : $(GLAPI)/gen/gl_and_es_API.xml $(glapi_gen_mapi_deps)
-	$(call glapi_gen_mapi,$<,noop-gl)
+g_libglglxwrapper.c : $(glapi_gen_libglglxstubs_deps)
+	$(call glapi_gen_libglglxstubs)
 
 libGL_la_CFLAGS = \
 	-I$(top_srcdir)/include
 
-libGL_la_LDFLAGS = -shared -Wl,--auxiliary=libGLdispatch.so.0 -Wl,--auxiliary=libGLX.so.0
+if USE_DT_AUXILIARY
+# XXX: libtool has trouble processing "-Wl,*" options, so we use -Xlinker here
+# instead.
+DT_AUX_FLAGS = -Xlinker "--auxiliary=libGLX.so.0" -Xlinker "--auxiliary=libGLdispatch.so.0"
+else
+DT_AUX_FLAGS =
+endif
 
-libGL_la_LIBADD = ../GLX/libGLX.la ../GLdispatch/libGLdispatch.la
+libGL_la_LDFLAGS = -shared -version-info 1 $(LINKER_FLAG_NO_UNDEFINED) $(DT_AUX_FLAGS)
+
+AM_CPPFLAGS = \
+	-I$(TOP)/src/GLdispatch/vnd-glapi/mapi \
+	-I$(TOP)/src/GLX \
+	-I$(TOP)/src/GLdispatch \
+	-I$(TOP)/src/util \
+	-I$(TOP)/src/util/glvnd_pthread \
+	-DMAPI_ABI_HEADER=\"$(builddir)/g_glapi_mapi_gl_tmp.h\" \
+	-DSTATIC_DISPATCH_ONLY
+
+libGL_la_LIBADD  = ../GLX/libGLX.la
+libGL_la_LIBADD += ../GLdispatch/libGLdispatch.la
+libGL_la_LIBADD += -ldl

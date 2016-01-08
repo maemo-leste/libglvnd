@@ -32,8 +32,7 @@ noinst_HEADERS = test_utils.h
 
 TESTS_ENVIRONMENT = \
 	TOP_BUILDDIR=$(top_builddir) \
-	ABS_TOP_BUILDDIR=$(abs_top_builddir) \
-	DISPLAY=:0
+	ABS_TOP_BUILDDIR=$(abs_top_builddir)
 
 TESTS = \
 	init_test_env.sh \
@@ -48,6 +47,7 @@ TESTS = \
 	testglxqueryversion.sh \
 	testglxnscreens.sh \
 	testglxnscrthreads.sh \
+	testpatchentrypoints.sh \
 	fini_test_env.sh
 
 EXTRA_DIST = $(TESTS)
@@ -59,6 +59,7 @@ check_PROGRAMS = \
 	testx11glvndproto \
 	testglxgetclientstr \
 	testglxqueryversion \
+	testpatchentrypoints \
 	testglxnscreens
 
 testglxnscreens_SOURCES = \
@@ -106,7 +107,8 @@ AM_CFLAGS =                                  \
 	-I$(top_srcdir)/src/util/glvnd_pthread
 
 
-testglxgetprocaddress_LDADD = $(top_builddir)/src/GLX/libGLX.la
+testglxgetprocaddress_LDADD = -lX11
+testglxgetprocaddress_LDADD += $(top_builddir)/src/GLX/libGLX.la
 
 testglxmakecurrent_LDADD = -lX11
 testglxmakecurrent_LDADD += $(top_builddir)/src/GLX/libGLX.la
@@ -123,3 +125,12 @@ testglxqueryversion_LDADD = -lX11
 testglxqueryversion_LDADD += $(top_builddir)/src/GLX/libGLX.la
 testglxqueryversion_LDADD += $(top_builddir)/src/OpenGL/libOpenGL.la
 testglxqueryversion_LDADD += $(top_builddir)/src/util/trace/libtrace.la
+
+testpatchentrypoints_SOURCES = \
+	testpatchentrypoints.c \
+	test_utils.c
+
+testpatchentrypoints_LDADD = -lX11 -ldl
+testpatchentrypoints_LDADD += $(top_builddir)/src/GLX/libGLX.la
+testpatchentrypoints_LDADD += $(top_builddir)/src/OpenGL/libOpenGL.la
+testpatchentrypoints_LDADD += $(top_builddir)/src/util/trace/libtrace.la

@@ -33,13 +33,31 @@
 #include <X11/Xlib.h>
 
 /*
- * Describes the client-side functions implemented by the XGLVendor extension.
+ * Describes the client-side functions implemented by the x11glvnd extension.
  * This is a simple extension to query the X server for XID -> screen and screen
  * -> vendor mappings, used by libGLX. This may eventually be replaced by a
  *  server-side GLX extension which does the same thing.
  */
 
-#define XGLV_EXTENSION_NAME "XGLVendor"
+#define XGLV_EXTENSION_NAME "x11glvnd"
+
+/*!
+ * Determines if the x11glvnd extension is supported.
+ *
+ * \param[out] event_base_return Returns the base event code.
+ * \param[out] error_base_return Returns the base error code.
+ * \return True if the extension is available, or False if it is not.
+ */
+Bool XGLVQueryExtension(Display *dpy, int *event_base_return, int *error_base_return);
+
+/*!
+ * Returns the version of the x11glvnd extension supported by the server.
+ *
+ * \param[out] major Returns the major version number.
+ * \param[out] minor Returns the minor version number.
+ * \return nonzero if the server supports a compatible version of x11glvnd.
+ */
+Bool XGLVQueryVersion(Display *dpy, int *major, int *minor);
 
 /*!
  * Returns the screen associated with this XID, or -1 if there was an error.
@@ -52,10 +70,26 @@ int XGLVQueryXIDScreenMapping(
 /*!
  * Returns the vendor associated with this screen, or NULL if there was an
  * error.
+ *
+ * The caller must free the string with XFree.
  */
 char *XGLVQueryScreenVendorMapping(
     Display *dpy,
     int screen
 );
+
+/*
+ * Registers a callback with x11glvnd which is fired whenever XCloseDisplay()
+ * is called.  This gives x11glvnd clients a lightweight alternative to
+ * declaring themselves an X11 extension and using XESetCloseDisplay().
+ *
+ * This is NOT a thread-safe operation.
+ */
+void XGLVRegisterCloseDisplayCallback(void (*callback)(Display *));
+
+/*
+ * Unregisters all registered callbacks.
+ */
+void XGLVUnregisterCloseDisplayCallbacks(void);
 
 #endif // __X11GLVND_H__

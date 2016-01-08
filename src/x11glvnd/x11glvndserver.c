@@ -44,6 +44,14 @@
 #include "x11glvndserver.h"
 #include "glvnd_list.h"
 
+#define XGLV_ABI_HAS_DIX_REGISTER_PRIVATE_KEY    (GET_ABI_MAJOR(ABI_VIDEODRV_VERSION) >= 8)
+#define XGLV_ABI_HAS_DEV_PRIVATE_REWORK          (GET_ABI_MAJOR(ABI_VIDEODRV_VERSION) >= 4)
+#define XGLV_ABI_HAS_DIX_LOOKUP_RES_BY           (GET_ABI_MAJOR(ABI_VIDEODRV_VERSION) >= 6)
+#define XGLV_ABI_EXTENSION_MODULE_HAS_SETUP_FUNC_AND_INIT_DEPS \
+                                                 (GET_ABI_MAJOR(ABI_VIDEODRV_VERSION) <= 12)
+#define XGLV_ABI_HAS_LOAD_EXTENSION_LIST         (GET_ABI_MAJOR(ABI_VIDEODRV_VERSION) >= 17)
+#define XGLV_ABI_SWAP_MACROS_HAVE_N_ARG          (GET_ABI_MAJOR(ABI_VIDEODRV_VERSION) <= 11)
+
 /*
  * Screen-private structure
  */
@@ -51,14 +59,46 @@ typedef struct XGLVScreenPrivRec {
     char *vendorLib;
 } XGLVScreenPriv;
 
-DevPrivateKeyRec glvXGLVScreenPrivKey;
+static inline Bool xglvInitPrivateSpace(void);
+static inline XGLVScreenPriv *xglvGetScreenPrivate(ScreenPtr pScreen);
+static inline void xglvSetScreenPrivate(ScreenPtr pScreen, XGLVScreenPriv *priv);
+static inline int xglvLookupResource(pointer *result, XID id, RESTYPE rtype,
+        ClientPtr client, Mask access_mode);
 
-#define XGLV_SET_SCREEN_PRIVATE(pScreen, priv) \
-    dixSetPrivate(&(pScreen)->devPrivates, &glvXGLVScreenPrivKey, priv)
-#define XGLV_SCREEN_PRIVATE(pScreen) \
-    ((XGLVScreenPriv *)dixLookupPrivate(&(pScreen)->devPrivates, &glvXGLVScreenPrivKey));
-#define XGLV_INIT_PRIVATE_SPACE() \
-    dixRegisterPrivateKey(&glvXGLVScreenPrivKey, PRIVATE_SCREEN, 0)
+#if XGLV_ABI_HAS_DIX_REGISTER_PRIVATE_KEY
+// ABI >= 8
+static DevPrivateKeyRec glvXGLVScreenPrivKey;
+#elif XGLV_ABI_HAS_DEV_PRIVATE_REWORK // XGLV_ABI_HAS_DIX_REGISTER_PRIVATE_KEY
+// ABI 4 - 7
+// In ABI 5, DevPrivateKey is int* and needs to point to a unique int.
+// In ABI 4, DevPrivateKey is void* and just needs to be unique.
+// We just use the ABI 5 behavior for both for consistency.
+static int glvXGLVScreenPrivKey;
+#else
+// ABI <= 3
+static int glvXGLVScreenPrivKey = -1;
+#endif
+
+#if XGLV_ABI_SWAP_MACROS_HAVE_N_ARG
+
+#define XGLV_SWAPS(x)     \
+do {                      \
+    int _XGLV_SWAPN;      \
+    swaps(x, _XGLV_SWAPN);\
+} while(0)
+
+#define XGLV_SWAPL(x)     \
+do {                      \
+    int _XGLV_SWAPN;      \
+    swapl(x, _XGLV_SWAPN);\
+} while(0)
+
+#else
+
+#define XGLV_SWAPS(x) swaps(x)
+#define XGLV_SWAPL(x) swapl(x)
+
+#endif // XGLV_ABI_SWAP_FUNCS_TAKE_N_ARG
 
 /* Dispatch information */
 typedef int ProcVectorFunc(ClientPtr);
@@ -67,10 +107,12 @@ typedef ProcVectorFunc *ProcVectorFuncPtr;
 #define PROC_VECTOR_ENTRY(foo) [X_glv ## foo] = ProcGLV ## foo
 #define PROC_PROTO(foo) static int ProcGLV ## foo (ClientPtr client)
 
+PROC_PROTO(QueryVersion);
 PROC_PROTO(QueryXIDScreenMapping);
 PROC_PROTO(QueryScreenVendorMapping);
 
 static ProcVectorFuncPtr glvProcVector[X_glvLastRequest] = {
+    PROC_VECTOR_ENTRY(QueryVersion),
     PROC_VECTOR_ENTRY(QueryXIDScreenMapping),
     PROC_VECTOR_ENTRY(QueryScreenVendorMapping),
 };
@@ -84,6 +126,10 @@ static ExtensionModule glvExtensionModule = {
     GLVExtensionInit,
     XGLV_EXTENSION_NAME,
     NULL,
+#if XGLV_ABI_EXTENSION_MODULE_HAS_SETUP_FUNC_AND_INIT_DEPS
+    NULL,
+    NULL
+#endif
 };
 
 static XF86ModuleVersionInfo x11glvndVersionInfo =
@@ -107,27 +153,42 @@ static void *glvSetup(void *module, void *opts, int *errmaj, int *errmin);
  * the X server.
  */
 PUBLIC const XF86ModuleData x11glvndModuleData = { &x11glvndVersionInfo,
-                                            glvSetup, NULL };
+                                                   glvSetup, NULL };
 
 static void *glvSetup(void *module, void *opts, int *errmaj, int *errmin)
 {
+    static Bool x11glvndSetupDone = FALSE;
     typedef int (*LoaderGetABIVersionProc)(const char *abiclass);
     LoaderGetABIVersionProc pLoaderGetABIVersion;
-    int extMajor = 0;
+    int videoMajor = 0;
+
+    if (x11glvndSetupDone) {
+        if (errmaj) {
+            *errmaj = LDR_ONCEONLY;
+        }
+        return NULL;
+    }
+    x11glvndSetupDone = TRUE;
 
     xf86Msg(X_INFO, "x11glvnd Loading\n");
 
+    // All of the ABI checks use the video driver ABI version number, so that's
+    // what we'll check here.
     if ((pLoaderGetABIVersion = (LoaderGetABIVersionProc)LoaderSymbol("LoaderGetABIVersion"))) {
-        extMajor = GET_ABI_MAJOR(pLoaderGetABIVersion(ABI_CLASS_EXTENSION));
+        videoMajor = GET_ABI_MAJOR(pLoaderGetABIVersion(ABI_CLASS_VIDEODRV));
     }
 
-    if (extMajor != GET_ABI_MAJOR(ABI_EXTENSION_VERSION)) {
-        xf86Msg(X_INFO, "x11glvnd: X server major extension ABI mismatch: expected %d but saw %d\n",
-                GET_ABI_MAJOR(ABI_EXTENSION_VERSION), extMajor);
+    if (videoMajor != GET_ABI_MAJOR(ABI_VIDEODRV_VERSION)) {
+        xf86Msg(X_INFO, "x11glvnd: X server major video driver ABI mismatch: expected %d but saw %d\n",
+                GET_ABI_MAJOR(ABI_VIDEODRV_VERSION), videoMajor);
         return NULL;
     }
 
+#if XGLV_ABI_HAS_LOAD_EXTENSION_LIST
+    LoadExtensionList(&glvExtensionModule, 1, False);
+#else
     LoadExtension(&glvExtensionModule, False);
+#endif
 
     return (pointer)1;
 }
@@ -139,6 +200,8 @@ typedef struct DrawableTypeRec {
 
 struct glvnd_list xglvDrawableTypes;
 
+int LookupXIDScreenMapping(ClientPtr client, XID xid);
+
 int LookupXIDScreenMapping(ClientPtr client, XID xid)
 {
     DrawablePtr pDraw;
@@ -147,7 +210,7 @@ int LookupXIDScreenMapping(ClientPtr client, XID xid)
 
     glvnd_list_for_each_entry(drawType, &xglvDrawableTypes, entry) {
         pDraw = NULL;
-        status = dixLookupResourceByType((void **)&pDraw, xid,
+        status = xglvLookupResource((void **)&pDraw, xid,
                                         RT_WINDOW, client,
                                         BadDrawable);
         if (status == Success) {
@@ -165,7 +228,7 @@ int LookupXIDScreenMapping(ClientPtr client, XID xid)
 /*
  * Hook for GLX drivers to register their GLX drawable types.
  */
-PUBLIC void _XGLVRegisterGLXDrawableType(RESTYPE rtype)
+void _XGLVRegisterGLXDrawableType(RESTYPE rtype)
 {
     XGLVDrawableType *drawType = malloc(sizeof(*drawType));
 
@@ -181,6 +244,7 @@ static char *GetVendorForThisScreen(ScreenPtr pScreen)
 {
     ScrnInfoPtr pScrnInfo = xf86Screens[pScreen->myNum];
     const char *str;
+    char *processedStr;
     OptionInfoRec options[2];
 
     options[0].token = OPTION_GL_VENDOR;
@@ -213,7 +277,16 @@ static char *GetVendorForThisScreen(ScreenPtr pScreen)
         str = "unknown";
     }
 
-    return strdup(str);
+    processedStr = strdup(str);
+    if (processedStr) {
+        size_t i;
+        size_t len = strlen(processedStr);
+        for (i = 0; i < len; i++) {
+            processedStr[i] = tolower(processedStr[i]);
+        }
+    }
+
+    return processedStr;
 }
 
 static Bool xglvScreenInit(ScreenPtr pScreen)
@@ -234,9 +307,32 @@ static Bool xglvScreenInit(ScreenPtr pScreen)
         return False;
     }
 
-    XGLV_SET_SCREEN_PRIVATE(pScreen, pScreenPriv);
+    xglvSetScreenPrivate(pScreen, pScreenPriv);
 
     return True;
+}
+
+static int ProcGLVQueryVersion(ClientPtr client)
+{
+    xglvQueryVersionReply rep;
+    REQUEST(xglvQueryVersionReq);
+
+    REQUEST_SIZE_MATCH(*stuff);
+
+    // Write the reply
+    GLVND_REPLY_HEADER(rep, 0);
+    rep.majorVersion = XGLV_EXT_MAJOR;
+    rep.minorVersion = XGLV_EXT_MINOR;
+
+    if (client->swapped) {
+        XGLV_SWAPS(&rep.sequenceNumber);
+        XGLV_SWAPL(&rep.length);
+        XGLV_SWAPL(&rep.majorVersion);
+        XGLV_SWAPL(&rep.minorVersion);
+    }
+
+    WriteToClient(client, sz_xglvQueryVersionReply, (char *)&rep);
+    return client->noClientException;
 }
 
 // TODO: make sense to do this instead?
@@ -256,13 +352,16 @@ static int ProcGLVQueryXIDScreenMapping(ClientPtr client)
     REQUEST_SIZE_MATCH(*stuff);
 
     scrnum = LookupXIDScreenMapping(client, stuff->xid);
-    if (scrnum < 0) {
-        return BadValue;
-    }
 
     // Write the reply
     GLVND_REPLY_HEADER(rep, 0);
     rep.screen = scrnum;
+
+    if (client->swapped) {
+        XGLV_SWAPS(&rep.sequenceNumber);
+        XGLV_SWAPL(&rep.length);
+        XGLV_SWAPL(&rep.screen);
+    }
 
     WriteToClient(client, sz_xglvQueryXIDScreenMappingReply, (char *)&rep);
     return client->noClientException;
@@ -282,33 +381,46 @@ static int ProcGLVQueryScreenVendorMapping(ClientPtr client)
 
     if ((stuff->screen >= screenInfo.numScreens) ||
         (stuff->screen < 0)) {
-        return BadValue;
+        vendor = NULL;
+    } else {
+        pScreen = screenInfo.screens[stuff->screen];
+        pScreenPriv = xglvGetScreenPrivate(pScreen);
+        vendor = pScreenPriv->vendorLib;
     }
 
-    pScreen = screenInfo.screens[stuff->screen];
-    pScreenPriv = XGLV_SCREEN_PRIVATE(pScreen);
-    vendor = pScreenPriv->vendorLib;
+    if (vendor) {
+        n = strlen(vendor) + 1;
+        length = GLVND_PAD(n) >> 2;
+        buf = malloc(length << 2);
+        if (!buf) {
+            return BadAlloc;
+        }
+        strncpy(buf, vendor, n);
 
-    if (!vendor) {
-        return BadValue;
+        // Write the reply
+        GLVND_REPLY_HEADER(rep, length);
+        rep.n = n;
+
+        if (client->swapped) {
+            XGLV_SWAPS(&rep.sequenceNumber);
+            XGLV_SWAPL(&rep.length);
+            XGLV_SWAPL(&rep.n);
+        }
+
+        WriteToClient(client, sz_xglvQueryScreenVendorMappingReply, (char *)&rep);
+        WriteToClient(client, (int)(length << 2), buf);
+
+        free(buf);
+    } else {
+        GLVND_REPLY_HEADER(rep, 0);
+        rep.n = 0;
+        if (client->swapped) {
+            XGLV_SWAPS(&rep.sequenceNumber);
+            XGLV_SWAPL(&rep.length);
+            XGLV_SWAPL(&rep.n);
+        }
+        WriteToClient(client, sz_xglvQueryScreenVendorMappingReply, (char *)&rep);
     }
-
-    n = strlen(vendor) + 1;
-    length = GLVND_PAD(n) >> 2;
-    buf = malloc(length << 2);
-    if (!buf) {
-        return BadAlloc;
-    }
-    strncpy(buf, vendor, n);
-
-    // Write the reply
-    GLVND_REPLY_HEADER(rep, length);
-    rep.n = n;
-
-    WriteToClient(client, sz_xglvQueryScreenVendorMappingReply, (char *)&rep);
-    WriteToClient(client, (int)(length << 2), buf);
-
-    free(buf);
 
     return client->noClientException;
 }
@@ -356,7 +468,7 @@ static void GLVExtensionInit(void)
         // do stuff with extEntry?
     }
 
-    XGLV_INIT_PRIVATE_SPACE();
+    xglvInitPrivateSpace();
 
     for (i = 0; i < screenInfo.numScreens; i++) {
         xglvScreenInit(screenInfo.screens[i]);
@@ -366,5 +478,75 @@ static void GLVExtensionInit(void)
     drawType = malloc(sizeof(*drawType));
     drawType->rtype = RT_WINDOW;
     glvnd_list_add(&drawType->entry, &xglvDrawableTypes);
+}
+
+#if XGLV_ABI_HAS_DIX_REGISTER_PRIVATE_KEY
+// ABI >= 8
+
+Bool xglvInitPrivateSpace(void)
+{
+    return dixRegisterPrivateKey(&glvXGLVScreenPrivKey, PRIVATE_SCREEN, 0);
+}
+
+XGLVScreenPriv *xglvGetScreenPrivate(ScreenPtr pScreen)
+{
+    return (XGLVScreenPriv *) dixLookupPrivate(&pScreen->devPrivates, &glvXGLVScreenPrivKey);
+}
+
+void xglvSetScreenPrivate(ScreenPtr pScreen, XGLVScreenPriv *priv)
+{
+    dixSetPrivate(&pScreen->devPrivates, &glvXGLVScreenPrivKey, priv);
+}
+
+#elif XGLV_ABI_HAS_DEV_PRIVATE_REWORK // XGLV_ABI_HAS_DIX_REGISTER_PRIVATE_KEY
+// ABI 4 - 7
+
+Bool xglvInitPrivateSpace(void)
+{
+    return dixRequestPrivate(&glvXGLVScreenPrivKey, 0);
+}
+
+XGLVScreenPriv *xglvGetScreenPrivate(ScreenPtr pScreen)
+{
+    return (XGLVScreenPriv *) dixLookupPrivate(&pScreen->devPrivates, &glvXGLVScreenPrivKey);
+}
+
+void xglvSetScreenPrivate(ScreenPtr pScreen, XGLVScreenPriv *priv)
+{
+    dixSetPrivate(&pScreen->devPrivates, &glvXGLVScreenPrivKey, priv);
+}
+
+#else
+// ABI <= 3
+
+Bool xglvInitPrivateSpace(void)
+{
+    glvXGLVScreenPrivKey = AllocateScreenPrivateIndex();
+    return (glvXGLVScreenPrivKey >= 0);
+}
+
+XGLVScreenPriv *xglvGetScreenPrivate(ScreenPtr pScreen)
+{
+    return (XGLVScreenPriv *) (pScreen->devPrivates[glvXGLVScreenPrivKey].ptr);
+}
+
+void xglvSetScreenPrivate(ScreenPtr pScreen, XGLVScreenPriv *priv)
+{
+    pScreen->devPrivates[glvXGLVScreenPrivKey].ptr = priv;
+}
+
+#endif
+
+int xglvLookupResource(pointer *result, XID id, RESTYPE rtype,
+        ClientPtr client, Mask access_mode)
+{
+#if XGLV_ABI_HAS_DIX_LOOKUP_RES_BY
+    return dixLookupResourceByType(result, id, rtype, client, access_mode);
+#elif XGLV_ABI_HAS_DEV_PRIVATE_REWORK
+    return dixLookupResource(result, id, rtype, client, access_mode);
+#else
+    *result = SecurityLookupIDByType(client, id, rtype, access_mode);
+    return (*result ? Success : BadValue);
+#endif
 }
 

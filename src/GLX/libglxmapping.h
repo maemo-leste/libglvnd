@@ -32,17 +32,55 @@
 
 #include "libglxabipriv.h"
 #include "GLdispatch.h"
+#include "lkdhash.h"
+
+#define GLX_CLIENT_STRING_LAST_ATTRIB GLX_EXTENSIONS
+
+typedef struct __GLXdispatchTableDynamicRec __GLXdispatchTableDynamic;
 
 /*!
  * Structure containing relevant per-vendor information.
  */
-typedef struct __GLXvendorInfoRec {
+struct __GLXvendorInfoRec {
+    int vendorID; //< unique GLdispatch ID
     char *name; //< name of the vendor
     void *dlhandle; //< shared library handle
-    const __GLXdispatchTableStatic *staticDispatch; //< static GLX dispatch table
     __GLXdispatchTableDynamic *dynDispatch; //< dynamic GLX dispatch table
     __GLdispatchTable *glDispatch; //< GL dispatch table
-} __GLXvendorInfo;
+
+    const __GLXapiImports *glxvc;
+    __GLXdispatchTableStatic staticDispatch; //< static GLX dispatch table
+};
+
+typedef struct __GLXvendorXIDMappingHashRec __GLXvendorXIDMappingHash;
+
+/*!
+ * Structure containing per-display information.
+ */
+typedef struct __GLXdisplayInfoRec {
+    char *clientStrings[GLX_CLIENT_STRING_LAST_ATTRIB];
+
+    /**
+     * An array of vendors for each screen.
+     *
+     * Do not access this directly. Instead, call \c __glXLookupVendorByScreen.
+     */
+    __GLXvendorInfo **vendors;
+    glvnd_rwlock_t vendorLock;
+
+    DEFINE_LKDHASH(__GLXvendorXIDMappingHash, xidVendorHash);
+
+    /// True if the server supports the GLX extension.
+    Bool glxSupported;
+
+    /// The major opcode for GLX, if it's supported.
+    int glxMajorOpcode;
+    int glxFirstError;
+
+    Bool x11glvndSupported;
+    int x11glvndMajor;
+    int x11glvndMinor;
+} __GLXdisplayInfo;
 
 /*!
  * Accessor functions used to retrieve the "current" dispatch table for each of
@@ -51,7 +89,7 @@ typedef struct __GLXvendorInfoRec {
  */
 const __GLXdispatchTableStatic * __glXGetStaticDispatch(Display *dpy,
                                                         const int screen);
-__GLXdispatchTableDynamic *__glXGetDynDispatch(Display *dpy,
+__GLXvendorInfo *__glXGetDynDispatch(Display *dpy,
                                                const int screen);
 __GLdispatchTable *__glXGetGLDispatch(Display *dpy, const int screen);
 
@@ -59,19 +97,24 @@ __GLdispatchTable *__glXGetGLDispatch(Display *dpy, const int screen);
  * Various functions to manage mappings used to determine the screen
  * of a particular GLX call.
  */
-void __glXAddScreenContextMapping(GLXContext context, int screen);
-void __glXRemoveScreenContextMapping(GLXContext context, int screen);
-int __glXScreenFromContext(GLXContext context);
+void __glXAddVendorContextMapping(Display *dpy, GLXContext context, __GLXvendorInfo *vendor);
+void __glXRemoveVendorContextMapping(Display *dpy, GLXContext context);
+int __glXVendorFromContext(GLXContext context, __GLXvendorInfo **retVendor);
 
-void __glXAddScreenFBConfigMapping(GLXFBConfig config, int screen);
-void __glXRemoveScreenFBConfigMapping(GLXFBConfig config, int screen);
-int __glXScreenFromFBConfig(GLXFBConfig config);
+void __glXAddVendorFBConfigMapping(Display *dpy, GLXFBConfig config, __GLXvendorInfo *vendor);
+void __glXRemoveVendorFBConfigMapping(Display *dpy, GLXFBConfig config);
+int __glXVendorFromFBConfig(Display *dpy, GLXFBConfig config, __GLXvendorInfo **retVendor);
 
-void __glXAddScreenDrawableMapping(GLXDrawable drawable, int screen);
-void __glXRemoveScreenDrawableMapping(GLXDrawable drawable, int screen);
-int __glXScreenFromDrawable(Display *dpy, GLXDrawable drawable);
+void __glXAddScreenVisualMapping(Display *dpy, const XVisualInfo *visual, __GLXvendorInfo *vendor);
+void __glXRemoveScreenVisualMapping(Display *dpy, const XVisualInfo *visual);
+int __glXVendorFromVisual(Display *dpy, const XVisualInfo *visual, __GLXvendorInfo **retVendor);
+
+void __glXAddVendorDrawableMapping(Display *dpy, GLXDrawable drawable, __GLXvendorInfo *vendor);
+void __glXRemoveVendorDrawableMapping(Display *dpy, GLXDrawable drawable);
+int __glXVendorFromDrawable(Display *dpy, GLXDrawable drawable, __GLXvendorInfo **retVendor);
 
 __GLXextFuncPtr __glXGetGLXDispatchAddress(const GLubyte *procName);
+__GLXextFuncPtr __glXGenerateGLXEntrypoint(const GLubyte *procName);
 
 /*!
  * Looks up the vendor by name or screen number. This has the side effect of
@@ -80,11 +123,26 @@ __GLXextFuncPtr __glXGetGLXDispatchAddress(const GLubyte *procName);
 __GLXvendorInfo *__glXLookupVendorByName(const char *vendorName);
 __GLXvendorInfo *__glXLookupVendorByScreen(Display *dpy, const int screen);
 
+/*!
+ * Looks up the __GLXdisplayInfo structure for a display, creating it if
+ * necessary.
+ */
+__GLXdisplayInfo *__glXLookupDisplay(Display *dpy);
+
+/*!
+ * Frees the __GLXdisplayInfo structure for a display, if one exists.
+ */
+void __glXFreeDisplay(Display *dpy);
+
+/*!
+ * Notifies libglvnd that a context has been marked for destruction.
+ */
+void __glXNotifyContextDestroyed(GLXContext ctx);
+
 /*
  * Close the vendor library and perform any relevant teardown. This should
- * be called on each vendor when the API library is unloaded.
- * TODO implement me
+ * be called when the API library is unloaded.
  */
-void __glXUnloadVendor(__GLXvendorInfo *vendor);
+void __glXMappingTeardown(Bool doReset);
 
 #endif /* __LIB_GLX_MAPPING_H */

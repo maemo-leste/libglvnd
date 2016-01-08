@@ -48,10 +48,19 @@
  * to be wrapped.
  */
 typedef pthread_mutex_t glvnd_mutex_t;
+typedef pthread_mutexattr_t glvnd_mutexattr_t;
+
+#if defined(HAVE_PTHREAD_RWLOCK_T)
 typedef pthread_rwlock_t glvnd_rwlock_t;
+typedef pthread_rwlockattr_t glvnd_rwlockattr_t;
+#define GLVND_RWLOCK_INITIALIZER PTHREAD_RWLOCK_INITIALIZER
+#else
+typedef pthread_mutex_t glvnd_rwlock_t;
+typedef pthread_mutexattr_t glvnd_rwlockattr_t;
+#define GLVND_RWLOCK_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+#endif
 
 #define GLVND_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
-#define GLVND_RWLOCK_INITIALIZER PTHREAD_RWLOCK_INITIALIZER
 
 typedef struct _glvnd_once_t {
     pthread_once_t once;
@@ -62,11 +71,18 @@ typedef struct _glvnd_once_t {
 
 typedef struct _glvnd_thread_t {
     pthread_t tid;
-    int singlethreaded;
+    int valid;
 } glvnd_thread_t;
 
+#define GLVND_THREAD_NULL_INIT {}
+
 typedef pthread_attr_t glvnd_thread_attr_t;
-typedef pthread_rwlockattr_t glvnd_rwlockattr_t;
+
+typedef union {
+    pthread_key_t key;
+    void **data;
+} glvnd_key_t;
+#define GLVND_KEYS_MAX PTHREAD_KEYS_MAX
 
 /*!
  * Struct defining the wrapper functions implemented by this library.
@@ -84,16 +100,45 @@ typedef struct GLVNDPthreadFuncsRec {
     int (*equal)(glvnd_thread_t t1, glvnd_thread_t t2);
 
     /* Locking primitives */
+    int (*mutex_init)(glvnd_mutex_t *mutex, const glvnd_mutexattr_t *attr);
+    int (*mutex_destroy)(glvnd_mutex_t *mutex);
     int (*mutex_lock)(glvnd_mutex_t *mutex);
     int (*mutex_unlock)(glvnd_mutex_t *mutex);
+
+    int (* mutexattr_init) (glvnd_mutexattr_t *attr);
+    int (* mutexattr_destroy) (glvnd_mutexattr_t *attr);
+    int (* mutexattr_settype) (glvnd_mutexattr_t *attr, int kind);
+
     int (*rwlock_init)(glvnd_rwlock_t *rwlock, const glvnd_rwlockattr_t *attr);
+    int (*rwlock_destroy)(glvnd_rwlock_t *rwlock);
     int (*rwlock_rdlock)(glvnd_rwlock_t *rwlock);
     int (*rwlock_wrlock)(glvnd_rwlock_t *rwlock);
     int (*rwlock_unlock)(glvnd_rwlock_t *rwlock);
 
     /* Other used functions */
     int (*once)(glvnd_once_t *once_control, void (*init_routine)(void));
+
+    /*
+     * TSD key management.  Used to handle the corner case when a thread
+     * is destroyed with a context current.
+     */
+    int (*key_create)(glvnd_key_t *key, void (*destr_function)(void *));
+    int (*key_delete)(glvnd_key_t key);
+    int (*setspecific)(glvnd_key_t key, const void *p);
+    void *(*getspecific)(glvnd_key_t key);
+
+    /*
+     * Are we single-threaded?
+     */
+    int is_singlethreaded;
 } GLVNDPthreadFuncs;
+
+/**
+ * A NULL glvnd_thread_t value. This is mainly useful as something to pass to
+ * \c GLVNDPthreadFuncs.equal. To initialize a glvnd_thread_t variable, use
+ * \c GLVND_THREAD_NULL_INIT.
+ */
+extern const glvnd_thread_t GLVND_THREAD_NULL;
 
 /*!
  * \brief Sets up pthreads wrappers.
@@ -104,10 +149,8 @@ typedef struct GLVNDPthreadFuncsRec {
  *
  * \param [in] dlhandle A handle compatible with dlsym(3).
  * \param [in] funcs A table of pthreads funcs to initialize.
- * \return 0 if the table was filled in with singlethreaded wrappers, or
- *         1 if the table was filled in with multithreaded wrappers.
  */
-int glvndSetupPthreads(void *dlhandle, GLVNDPthreadFuncs *funcs);
+void glvndSetupPthreads(void *dlhandle, GLVNDPthreadFuncs *funcs);
 
 
 

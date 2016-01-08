@@ -122,7 +122,11 @@ static PFNGLMAKECURRENTTESTRESULTSPROC GetMakeCurrentTestResults(void)
     for (i = 0; i < 3; i++) {
         proc = (PFNGLMAKECURRENTTESTRESULTSPROC)
             glXGetProcAddress((GLubyte *)"glMakeCurrentTestResults");
-        assert((i == 0) || (proc == old_proc));
+        if ((i != 0) && (proc != old_proc))
+        {
+            printError("Got different addresses for glMakeCurrentTestResults: %p, %p\n", proc, old_proc);
+            return NULL;
+        }
         old_proc = proc;
     }
     return proc;
@@ -148,14 +152,14 @@ void *MakeCurrentThread(void *arg)
     const TestOptions *t = (const TestOptions *)arg;
     Display *dpy;
 
+    memset(&wi, 0, sizeof(wi));
+
     dpy = XOpenDisplay(NULL);
     if (!dpy) {
         printError("No display! Please re-test with a running X server\n"
                    "and the DISPLAY environment variable set appropriately.\n");
         goto fail;
     }
-
-    memset(&wi, 0, sizeof(wi));
 
     // Test the robustness of GetProcAddress() by calling this separately for
     // each thread.
@@ -297,7 +301,9 @@ int main(int argc, char **argv)
 
         XInitThreads();
 
-        if (!glvndSetupPthreads(RTLD_DEFAULT, &pImp)) {
+        glvndSetupPthreads(RTLD_DEFAULT, &pImp);
+
+        if (pImp.is_singlethreaded) {
             exit(1);
         }
 

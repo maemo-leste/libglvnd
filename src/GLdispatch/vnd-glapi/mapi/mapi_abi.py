@@ -38,7 +38,7 @@ import glX_XML
 
 
 # number of dynamic entries
-ABI_NUM_DYNAMIC_ENTRIES = 256
+ABI_NUM_DYNAMIC_ENTRIES = 4096
 
 class ABIEntry(object):
     """Represent an ABI entry."""
@@ -438,7 +438,7 @@ class ABIPrinter(object):
             if ent.ret:
                 ret = 'return '
             stmt1 = self.indent
-            stmt1 += 'const struct mapi_table *_tbl = %s();' % (
+            stmt1 += 'const struct _glapi_table *_tbl = %s();' % (
                     self.current_get)
             stmt2 = self.indent
             stmt2 += 'mapi_func _func = ((const mapi_func *) _tbl)[%d];' % (
@@ -729,13 +729,8 @@ class GLAPIPrinter(ABIPrinter):
     def _get_c_header(self):
         header = """#ifndef _GLAPI_TMP_H_
 #define _GLAPI_TMP_H_
-#ifdef USE_MGL_NAMESPACE
-#define GLAPI_PREFIX(func)  mgl##func
-#define GLAPI_PREFIX_STR(func)  "mgl"#func
-#else
 #define GLAPI_PREFIX(func)  gl##func
 #define GLAPI_PREFIX_STR(func)  "gl"#func
-#endif /* USE_MGL_NAMESPACE */
 
 typedef int GLclampx;
 #endif /* _GLAPI_TMP_H_ */"""

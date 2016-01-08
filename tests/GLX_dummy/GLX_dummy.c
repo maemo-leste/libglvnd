@@ -398,7 +398,7 @@ static void dispatch_glXExampleExtensionFunction(Display *dpy,
                                                 int screen,
                                                 int *retval)
 {
-    __GLXdispatchTableDynamic *dynDispatch;
+    __GLXvendorInfo *dynDispatch;
     ExampleExtensionFunctionPtr func;
     const int index = dummyExampleExtensionFunctionIndex;
 
@@ -429,17 +429,50 @@ static struct {
     GL_PROC_ENTRY(End),
     GL_PROC_ENTRY(Vertex3fv),
     GL_PROC_ENTRY(MakeCurrentTestResults),
-    GLX_PROC_ENTRY(ExampleExtensionFunction)
+    GLX_PROC_ENTRY(ExampleExtensionFunction),
+
+    GLX_PROC_ENTRY(ChooseVisual),
+    GLX_PROC_ENTRY(CopyContext),
+    GLX_PROC_ENTRY(CreateContext),
+    GLX_PROC_ENTRY(CreateGLXPixmap),
+    GLX_PROC_ENTRY(DestroyContext),
+    GLX_PROC_ENTRY(DestroyGLXPixmap),
+    GLX_PROC_ENTRY(GetConfig),
+    GLX_PROC_ENTRY(IsDirect),
+    GLX_PROC_ENTRY(MakeCurrent),
+    GLX_PROC_ENTRY(SwapBuffers),
+    GLX_PROC_ENTRY(UseXFont),
+    GLX_PROC_ENTRY(WaitGL),
+    GLX_PROC_ENTRY(WaitX),
+    GLX_PROC_ENTRY(QueryServerString),
+    GLX_PROC_ENTRY(GetClientString),
+    GLX_PROC_ENTRY(QueryExtensionsString),
+    GLX_PROC_ENTRY(ChooseFBConfig),
+    GLX_PROC_ENTRY(CreateNewContext),
+    GLX_PROC_ENTRY(CreatePbuffer),
+    GLX_PROC_ENTRY(CreatePixmap),
+    GLX_PROC_ENTRY(CreateWindow),
+    GLX_PROC_ENTRY(DestroyPbuffer),
+    GLX_PROC_ENTRY(DestroyPixmap),
+    GLX_PROC_ENTRY(DestroyWindow),
+    GLX_PROC_ENTRY(GetFBConfigAttrib),
+    GLX_PROC_ENTRY(GetFBConfigs),
+    GLX_PROC_ENTRY(GetSelectedEvent),
+    GLX_PROC_ENTRY(GetVisualFromFBConfig),
+    GLX_PROC_ENTRY(MakeContextCurrent),
+    GLX_PROC_ENTRY(QueryContext),
+    GLX_PROC_ENTRY(QueryDrawable),
+    GLX_PROC_ENTRY(SelectEvent),
 };
 
 
-static void dummyNopStub (void)
+// XXX non-entry point ABI functions
+static Bool          dummyCheckSupportsScreen    (Display *dpy, int screen)
 {
-    // nop
+    return True;
 }
 
-// XXX non-entry point ABI functions
-static void         *dummyGetProcAddress         (const GLubyte *procName, void *data)
+static void         *dummyGetProcAddress         (const GLubyte *procName)
 {
     int i;
     for (i = 0; i < ARRAY_LEN(procAddresses); i++) {
@@ -448,12 +481,7 @@ static void         *dummyGetProcAddress         (const GLubyte *procName, void 
         }
     }
 
-    return (void *)dummyNopStub;
-}
-
-static void dummyDestroyDispatchData(void *data)
-{
-    // nop
+    return NULL;
 }
 
 static void         *dummyGetDispatchAddress     (const GLubyte *procName)
@@ -472,70 +500,194 @@ static void         dummySetDispatchIndex      (const GLubyte *procName, int ind
     }
 }
 
-static GLboolean    dummyGetDispatchProto   (const GLubyte *procName,
-                                          char ***function_names,
-                                          char **parameter_signature)
+#if defined(PATCH_ENTRYPOINTS)
+PUBLIC int __glXSawVertex3fv;
+
+static void patch_x86_64_tls(char *writeEntry,
+                             const char *execEntry,
+                             int stubSize)
 {
-    // We only export one extension function here
-    // TODO: Maybe a good idea to test a bunch of different protos?
-    if (!strcmp((const char *)procName, "glMakeCurrentTestResults")) {
-        *function_names = malloc(2 * sizeof(char *));
-        (*function_names)[0] = strdup("glMakeCurrentTestResults");
-        (*function_names)[1] = NULL;
-        *parameter_signature = strdup("ipp");
-        return GL_TRUE;
+#if defined(__x86_64__)
+    char *pSawVertex3fv = (char *)&__glXSawVertex3fv;
+    int *p;
+    char tmpl[] = {
+        0x8b, 0x05, 0x0, 0x0, 0x0, 0x0,  // mov 0x0(%rip), %eax
+        0x83, 0xc0, 0x01,                // add $0x1, %eax
+        0x89, 0x05, 0x0, 0x0, 0x0, 0x0,  // mov %eax, 0x0(%rip)
+        0xc3,                            // ret
+    };
+
+    STATIC_ASSERT(sizeof(int) == 0x4);
+
+    if (stubSize < sizeof(tmpl)) {
+        return;
     }
 
-    return GL_FALSE;
+    p = (int *)&tmpl[2];
+    *p = (int)(pSawVertex3fv - (execEntry + 6));
+
+    p = (int *)&tmpl[11];
+    *p = (int)(pSawVertex3fv - (execEntry + 15));
+
+    memcpy(writeEntry, tmpl, sizeof(tmpl));
+#else
+    assert(0); // Should not be calling this
+#endif
 }
 
+static void patch_x86_tls(char *writeEntry,
+                          const char *execEntry,
+                          int stubSize)
+{
+#if defined(__i386__)
+    uintptr_t *p;
+    char tmpl[] = {
+        0xa1, 0x0, 0x0, 0x0, 0x0,   // mov 0x0, %eax
+        0x83, 0xc0, 0x01,           // add $0x1, %eax
+        0xa3, 0x0, 0x0, 0x0, 0x0,   // mov %eax, 0x0
+        0xc3                        // ret
+    };
+
+    STATIC_ASSERT(sizeof(int) == 0x4);
+
+    if (stubSize < sizeof(tmpl)) {
+        return;
+    }
+
+    // Patch the address of the __glXSawVertex3fv variable. Note that we patch
+    // in an absolute address in this case. Unlike x86-64, x86 does not allow
+    // PC-relative addressing for MOV instructions.
+    p = (uintptr_t *)&tmpl[1];
+    *p = (uintptr_t) &__glXSawVertex3fv;
+
+    p = (uintptr_t *)&tmpl[9];
+    *p = (uintptr_t) &__glXSawVertex3fv;
+
+    memcpy(writeEntry, tmpl, sizeof(tmpl));
+
+    // Jump to an intermediate location
+    __asm__(
+        "\tjmp 0f\n"
+        "\t0:\n"
+    );
+#else
+    assert(0); // Should not be calling this
+#endif
+}
+
+static void patch_armv7_thumb_tsd(char *writeEntry,
+                                  const char *execEntry,
+                                  int stubSize)
+{
+#if defined(__arm__)
+    char *pSawVertex3fv = (char *)&__glXSawVertex3fv;
+
+    // Thumb bytecode
+    char tmpl[] = {
+        // ldr r0, 1f
+        0x48, 0x02,
+        // ldr r1, [r0]
+        0x68, 0x01,
+        // add r1, r1, #1
+        0xf1, 0x01, 0x01, 0x01,
+        // str r1, [r0]
+        0x60, 0x01,
+        // bx lr
+        0x47, 0x70,
+        // 1:
+        0x00, 0x00, 0x00, 0x00,
+    };
+
+    int offsetAddr = sizeof(tmpl) - 4;
+
+    if (stubSize < sizeof(tmpl)) {
+        return;
+    }
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    glvnd_byte_swap16((uint16_t *)tmpl, offsetAddr);
+#endif
+
+    *((uint32_t *)(tmpl + offsetAddr)) = (uint32_t)pSawVertex3fv;
+
+    memcpy(writeEntry, tmpl, sizeof(tmpl));
+
+    __builtin___clear_cache((char *) execEntry, (char *) (execEntry + sizeof(tmpl)));
+#else
+    assert(0); // Should not be calling this
+#endif
+}
+
+static GLboolean dummyCheckPatchSupported(int type, int stubSize)
+{
+    switch (type) {
+        case __GLDISPATCH_STUB_X86_64_TLS:
+        case __GLDISPATCH_STUB_X86_TLS:
+        case __GLDISPATCH_STUB_X86_TSD:
+        case __GLDISPATCH_STUB_X86_64_TSD:
+        case __GLDISPATCH_STUB_ARMV7_THUMB_TSD:
+            return GL_TRUE;
+        default:
+            return GL_FALSE;
+    }
+}
+
+static GLboolean dummyInitiatePatch(int type,
+                                    int stubSize,
+                                    DispatchPatchLookupStubOffset lookupStubOffset)
+{
+    void *writeAddr;
+    const void *execAddr;
+
+    if (!dummyCheckPatchSupported(type, stubSize))
+    {
+        return GL_FALSE;
+    }
+
+    if (lookupStubOffset("Vertex3fv", &writeAddr, &execAddr)) {
+        switch (type) {
+            case __GLDISPATCH_STUB_X86_64_TLS:
+            case __GLDISPATCH_STUB_X86_64_TSD:
+                patch_x86_64_tls(writeAddr, execAddr, stubSize);
+                break;
+            case __GLDISPATCH_STUB_X86_TLS:
+            case __GLDISPATCH_STUB_X86_TSD:
+                patch_x86_tls(writeAddr, execAddr, stubSize);
+                break;
+            case __GLDISPATCH_STUB_ARMV7_THUMB_TSD:
+                patch_armv7_thumb_tsd(writeAddr, execAddr, stubSize);
+                break;
+            default:
+                assert(0);
+        }
+    }
+
+    return GL_TRUE;
+}
+
+static void dummyReleasePatch(void)
+{
+}
+
+static const __GLdispatchPatchCallbacks dummyPatchCallbacks =
+{
+    .checkPatchSupported = dummyCheckPatchSupported,
+    .initiatePatch = dummyInitiatePatch,
+    .releasePatch = dummyReleasePatch,
+};
+#endif // defined(PATCH_ENTRYPOINTS)
 
 static const __GLXapiImports dummyImports =
 {
-    /* Entry points */
-    .glx14ep = {
-        .chooseVisual = dummyChooseVisual,
-        .copyContext = dummyCopyContext,
-        .createContext = dummyCreateContext,
-        .createGLXPixmap = dummyCreateGLXPixmap,
-        .destroyContext = dummyDestroyContext,
-        .destroyGLXPixmap = dummyDestroyGLXPixmap,
-        .getConfig = dummyGetConfig,
-        .isDirect = dummyIsDirect,
-        .makeCurrent = dummyMakeCurrent,
-        .swapBuffers = dummySwapBuffers,
-        .useXFont = dummyUseXFont,
-        .waitGL = dummyWaitGL,
-        .waitX = dummyWaitX,
-        .queryServerString = dummyQueryServerString,
-        .getClientString = dummyGetClientString,
-        .queryExtensionsString = dummyQueryExtensionsString,
-        .chooseFBConfig = dummyChooseFBConfig,
-        .createNewContext = dummyCreateNewContext,
-        .createPbuffer = dummyCreatePbuffer,
-        .createPixmap = dummyCreatePixmap,
-        .createWindow = dummyCreateWindow,
-        .destroyPbuffer = dummyDestroyPbuffer,
-        .destroyPixmap = dummyDestroyPixmap,
-        .destroyWindow = dummyDestroyWindow,
-        .getFBConfigAttrib = dummyGetFBConfigAttrib,
-        .getFBConfigs = dummyGetFBConfigs,
-        .getSelectedEvent = dummyGetSelectedEvent,
-        .getVisualFromFBConfig = dummyGetVisualFromFBConfig,
-        .makeContextCurrent = dummyMakeContextCurrent,
-        .queryContext = dummyQueryContext,
-        .queryDrawable = dummyQueryDrawable,
-        .selectEvent = dummySelectEvent,
-    },
-
-    /* Non-entry points */
-    .glxvc = {
-        .getProcAddress = dummyGetProcAddress,
-        .destroyDispatchData = dummyDestroyDispatchData,
-        .getDispatchAddress = dummyGetDispatchAddress,
-        .setDispatchIndex = dummySetDispatchIndex,
-        .getDispatchProto = dummyGetDispatchProto
-    }
+    .checkSupportsScreen = dummyCheckSupportsScreen,
+    .getProcAddress = dummyGetProcAddress,
+    .getDispatchAddress = dummyGetDispatchAddress,
+    .setDispatchIndex = dummySetDispatchIndex,
+#if defined(PATCH_ENTRYPOINTS)
+    .patchCallbacks = &dummyPatchCallbacks,
+#else
+    .patchCallbacks = NULL,
+#endif
 };
 
 PUBLIC __GLX_MAIN_PROTO(version, exports, vendorName)

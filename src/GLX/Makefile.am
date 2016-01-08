@@ -29,10 +29,10 @@ noinst_HEADERS = \
 	libglxabi.h \
 	libglxabipriv.h \
 	libglxcurrent.h \
-	libglxgldispatch.h \
 	libglxmapping.h \
 	libglxnoop.h \
-	libglxnoopdefs.h \
+	libglxgl.h \
+	libglxstring.h \
 	libglxthread.h
 
 lib_LTLIBRARIES = libGLX.la
@@ -66,10 +66,19 @@ libGLX_la_LIBADD += $(X11GLVND_DIR)/libx11glvnd_client.la
 libGLX_la_LIBADD += $(TRACE_DIR)/libtrace.la
 libGLX_la_LIBADD += $(GLVND_PTHREAD_DIR)/libglvnd_pthread.la
 
-libGLX_la_LDFLAGS = -shared
+libGLX_la_LDFLAGS = -shared -Wl,-Bsymbolic -version-info 0 $(LINKER_FLAG_NO_UNDEFINED)
+
+BUILT_SOURCES = g_libglxnoop.c
+
+EXTRA_DIST = gen_stubs.pl glx_funcs.spec
+
+g_libglxnoop.c : gen_stubs.pl glx_funcs.spec
+	$(AM_V_GEN)$(PERL) $(srcdir)/gen_stubs.pl "noop" $(srcdir)/glx_funcs.spec > $@
 
 libGLX_la_SOURCES = \
 	libglx.c \
 	libglxmapping.c \
-	libglxnoop.c \
-	libglxgldispatch.c
+	libglxstring.c \
+	$(UTIL_DIR)/glvnd_genentry.c \
+	$(UTIL_DIR)/utils_misc.c \
+	g_libglxnoop.c

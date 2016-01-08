@@ -44,8 +44,9 @@
 #ifndef _GLAPI_H
 #define _GLAPI_H
 
-#include "glapi/glthread.h"
-
+#include <stddef.h>
+#include <GL/gl.h>
+#include "u_compiler.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,144 +71,187 @@ extern "C" {
 
 
 /* Is this needed?  It is incomplete anyway. */
-#ifdef USE_MGL_NAMESPACE
-#define _glapi_set_dispatch _mglapi_set_dispatch
-#define _glapi_get_dispatch _mglapi_get_dispatch
-#define _glapi_set_context _mglapi_set_context
-#define _glapi_get_context _mglapi_get_context
-#define _glapi_set_current _mglapi_set_current
-#define _glapi_get_current _mglapi_get_current
-#define _glapi_Current _mglapi_Current
-#endif
 
 typedef void (*_glapi_proc)(void);
 struct _glapi_table;
 
 enum {
     GLAPI_CURRENT_DISPATCH = 0, /* This MUST be the first entry! */
-    GLAPI_CURRENT_CONTEXT,
-    GLAPI_CURRENT_USER1,
-    GLAPI_CURRENT_USER2,
-    GLAPI_CURRENT_USER3,
     GLAPI_NUM_CURRENT_ENTRIES
 };
 
 
-#if defined (GLX_USE_TLS)
+#if defined (GLDISPATCH_USE_TLS)
 
-_GLAPI_EXPORT extern __thread void *
+/**
+ * A pointer to each thread's dispatch table.
+ */
+_GLAPI_EXPORT extern const __thread void *
     _glapi_tls_Current[GLAPI_NUM_CURRENT_ENTRIES]
     __attribute__((tls_model("initial-exec")));
 
+#endif /* defined (GLDISPATCH_USE_TLS) */
+
+/**
+ * A pointer to the current dispatch table, used with the TSD versions of the
+ * dispatch functions.
+ *
+ * For applications that only render from a single thread, there's only one
+ * dispatch table. In that case, the dispatch functions will look up the
+ * dispatch table from this variable, so that they avoid the overhead of
+ * calling pthread_getspecific.
+ *
+ * With a multithreaded app, this variable will contain NULL.
+ */
 _GLAPI_EXPORT extern const void *_glapi_Current[GLAPI_NUM_CURRENT_ENTRIES];
 
-# define GET_DISPATCH() ((struct _glapi_table *) \
-    _glapi_tls_Current[GLAPI_CURRENT_DISPATCH])
-# define GET_CURRENT_CONTEXT(C)  struct gl_context *C = (struct gl_context *) \
-    _glapi_tls_Current[GLAPI_CURRENT_CONTEXT]
 
-#else
-
-_GLAPI_EXPORT extern void *_glapi_Current[GLAPI_NUM_CURRENT_ENTRIES];
-
-# ifdef THREADS
-
-#  define GET_DISPATCH() \
-     (likely(_glapi_Current[GLAPI_CURRENT_DISPATCH]) ? \
-     (struct _glapi_table *)_glapi_Current[GLAPI_CURRENT_DISPATCH] : \
-      _glapi_get_dispatch())
-
-#  define GET_CURRENT_CONTEXT(C)  struct gl_context *C = (struct gl_context *) \
-     (likely(_glapi_Current[GLAPI_CURRENT_CONTEXT]) ? \
-      _glapi_Current[GLAPI_CURRENT_CONTEXT] : _glapi_get_context())
-
-# else
-
-#  define GET_DISPATCH() ((struct _glapi_table *) \
-    _glapi_Current[GLAPI_CURRENT_DISPATCH])
-#  define GET_CURRENT_CONTEXT(C)  struct gl_context *C = \
-    (struct gl_context *) _glapi_Current[GLAPI_CURRENT_CONTEXT]
-
-# endif
-
-#endif /* defined (GLX_USE_TLS) */
-
+/**
+ * Initializes the GLAPI layer.
+ */
+void
+_glapi_init(void);
 
 void
-_glapi_destroy_multithread(void);
+_glapi_destroy(void);
 
 
-_GLAPI_EXPORT void
-_glapi_check_multithread(void);
+/**
+ * Switches to multi-threaded mode. Some systems may have a more efficient
+ * dispatch path for single-threaded applications. This function is called from
+ * __glDispatchCheckMultithreaded when a second thread starts calling GLX
+ * functions.
+ */
+void
+_glapi_set_multithread(void);
 
 
-_GLAPI_EXPORT void
-_glapi_set_context(void *context);
+/**
+ * Sets the dispatch table for the current thread.
+ *
+ * If \p dispatch is NULL, then a table of no-op functions will be assigned
+ * instead.
+ */
+void
+_glapi_set_current(const struct _glapi_table *dispatch);
+
+/**
+ * Returns the dispatch table for the current thread.
+ */
+_GLAPI_EXPORT const struct _glapi_table *
+_glapi_get_current(void);
 
 
-_GLAPI_EXPORT void *
-_glapi_get_context(void);
-
-
-_GLAPI_EXPORT void
-_glapi_set_dispatch(struct _glapi_table *dispatch);
-
-_GLAPI_EXPORT void
-_glapi_set_current(void *p, int index);
-
-_GLAPI_EXPORT void *
-_glapi_get_current(int index);
-
-
-_GLAPI_EXPORT struct _glapi_table *
-_glapi_get_dispatch(void);
-
-
-_GLAPI_EXPORT unsigned int
+unsigned int
 _glapi_get_dispatch_table_size(void);
 
 
-_GLAPI_EXPORT int
-_glapi_add_dispatch( const char * const * function_names,
-		     const char * parameter_signature );
-
-_GLAPI_EXPORT int
+int
 _glapi_get_proc_offset(const char *funcName);
 
 
-_GLAPI_EXPORT _glapi_proc
+_glapi_proc
 _glapi_get_proc_address(const char *funcName);
 
 
-_GLAPI_EXPORT const char *
+const char *
 _glapi_get_proc_name(unsigned int offset);
 
-
-_GLAPI_EXPORT struct _glapi_table *
-_glapi_create_table_from_handle(void *handle, const char *symbol_prefix);
-
-_GLAPI_EXPORT void
+void
 _glapi_init_table_from_callback(struct _glapi_table *table,
                                 size_t entries,
-                                void *(*get_proc_addr)(const unsigned char *name,
-                                                       void *private_data),
-                                void *private_data);
+                                void *(*get_proc_addr)(const char *name, void *param),
+                                void *param);
 
-
-_GLAPI_EXPORT unsigned long
-_glthread_GetID(void);
-
-
-/*
- * These stubs are kept so that the old DRI drivers still load.
+/**
+ * Functions used for patching entrypoints. These functions are exported from
+ * an entrypoint library such as libGL.so or libOpenGL.so, and used in
+ * libGLdispatch.
+ *
+ * \note The \c startPatch, \c finishPatch, and \c abortPatch functions are
+ * currently unused, but will be used after some changes to
+ * __GLdispatchPatchCallbacks are finished.
  */
-_GLAPI_EXPORT void
-_glapi_noop_enable_warnings(unsigned char enable);
+typedef struct __GLdispatchStubPatchCallbacksRec {
+    /**
+     * Called before trying to patch any entrypoints.
+     *
+     * If startPatch succeeds, then libGLdispatch will call \c getPatchOffsets
+     * to fetch the address of each function.
+     *
+     * After it finishes patching, libGLdispatch will call either
+     * \c finishPatch or \c abortPatch.
+     *
+     * \return GL_TRUE on success, GL_FALSE on failure.
+     */
+    GLboolean (* startPatch) (void);
 
+    /**
+     * Finishes any patching. This is called after \c startPatch if patching
+     * is successful.
+     */
+    void (* finishPatch) (void);
 
-_GLAPI_EXPORT void
-_glapi_set_warning_func(_glapi_proc func);
+    /**
+     * Finishes any patching, and restores the entrypoints to their original
+     * state.
+     *
+     * This is called if an error occurrs and libGLdispatch has to abort
+     * patching the entrypoints.
+     */
+    void (* abortPatch) (void);
 
+    /**
+     * Called by libGLdispatch to restore each entrypoint to its normal,
+     * unpatched behavior.
+     *
+     * \return GL_TRUE on success, GL_FALSE on failure.
+     */
+    GLboolean (* restoreFuncs) (void);
+
+    /**
+     * Returns the address of a function to patch. This may or may not create a
+     * new stub function if one doesn't already exist.
+     *
+     * This function is passed to __GLdispatchPatchCallbacks::initiatePatch.
+     */
+    GLboolean (* getPatchOffset) (const char *name, void **writePtr, const void **execPtr);
+
+    /**
+     * Returns the type of the stub functions. This is one of the
+     * __GLDISPATCH_STUB_* values.
+     */
+    int (* getStubType) (void);
+
+    /**
+     * Returns the size of each stub.
+     */
+    int (* getStubSize) (void);
+
+} __GLdispatchStubPatchCallbacks;
+
+/*!
+ * This registers stubs with GLdispatch to be overwritten if a vendor library
+ * explicitly requests custom entrypoint code.  This is used by the wrapper
+ * interface libraries.
+ *
+ * This function returns an ID number, which is passed to
+ * \c __glDispatchUnregisterStubCallbacks to unregister the callbacks.
+ *
+ * \see stub_get_patch_callbacks for the table used for the entrypoints in
+ * libGL, libOpenGL, and libGLdispatch.
+ *
+ * \param callbacks A table of callback functions.
+ * \return A unique ID number, or -1 on failure.
+ */
+_GLAPI_EXPORT int __glDispatchRegisterStubCallbacks(const __GLdispatchStubPatchCallbacks *callbacks);
+
+/*!
+ * This unregisters the GLdispatch stubs, and performs any necessary cleanup.
+ *
+ * \param stubId The ID number returned from \c __glDispatchRegisterStubCallbacks.
+ */
+_GLAPI_EXPORT void __glDispatchUnregisterStubCallbacks(int stubId);
 
 #ifdef __cplusplus
 }

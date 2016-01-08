@@ -33,12 +33,33 @@
 #include "GLdispatch.h"
 #include "glapi.h"
 #include "glvnd_list.h"
+#include "entry.h"
+#include "utils_misc.h"
+
+/*!
+ * XXX: Any changes to the internal mapi enum should be accompanied by an ABI
+ * update, and vice versa.
+ */
+#define TLS_TYPE_CHECK(x) STATIC_ASSERT((int)__GLDISPATCH_STUB_ ## x == (int)ENTRY_ ## x)
+
+static inline void UNUSED __unused_tls_type_check(void)
+{
+    TLS_TYPE_CHECK(X86_TLS);
+    TLS_TYPE_CHECK(X86_64_TLS);
+    TLS_TYPE_CHECK(X86_TSD);
+    TLS_TYPE_CHECK(PURE_C);
+    TLS_TYPE_CHECK(X86_64_TSD);
+    TLS_TYPE_CHECK(ARMV7_THUMB_TSD);
+    TLS_TYPE_CHECK(NUM_TYPES);
+}
+
+#undef TLS_TYPE_CHECK
 
 /*!
  * Private dispatch table structure. This is used by GLdispatch for tracking
  * and updating dispatch tables.
  */
-typedef struct __GLdispatchTableRec {
+struct __GLdispatchTableRec {
     /*! Number of threads this dispatch is current on */
     int currentThreads;
 
@@ -47,17 +68,13 @@ typedef struct __GLdispatchTableRec {
 
     /*! Saved vendor library callbacks */
     __GLgetProcAddressCallback getProcAddress;
-    __GLgetDispatchProtoCallback getDispatchProto;
-    __GLdestroyVendorDataCallback destroyVendorData;
-
-    /*! A pointer to vendor-specific data */
-    void *vendorData;
+    void *getProcAddressParam;
 
     /*! The real dispatch table */
     struct _glapi_table *table;
 
     /*! List handle */
     struct glvnd_list entry;
-} __GLdispatchTable;
+};
 
 #endif

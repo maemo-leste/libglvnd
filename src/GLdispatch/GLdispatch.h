@@ -32,7 +32,15 @@
 
 #include "glheader.h"
 #include "compiler.h"
-#include "glvnd_pthread.h"
+#include "GLdispatchABI.h"
+
+/*!
+ * The current version of the ABI between libGLdispatch and the window system
+ * libraries.
+ *
+ * \see __glDispatchGetABIVersion
+ */
+#define GLDISPATCH_ABI_VERSION 0
 
 /*!
  * \defgroup gldispatch core GL/GLES dispatch and TLS module
@@ -44,33 +52,25 @@
  * library entrypoints.
  */
 
-/*
- * XXX: Kludge to export the get current function directly from glapi for
- * performance reasons.
- */
-#define CURRENT_CONTEXT     1  // GLAPI_CURRENT_CONTEXT
-#define CURRENT_API_STATE   2  // GLAPI_CURRENT_USER1
-
-PUBLIC void *_glapi_get_current(int index);
-
-typedef void (*__GLdispatchProc)(void);
-typedef void *(*__GLgetProcAddressCallback)(const GLubyte *procName,
-                                            void *vendorData);
-typedef void *(*__GLgetProcAddressCallback)(const GLubyte *procName,
-                                            void *vendorData);
-typedef GLboolean (*__GLgetDispatchProtoCallback)(const GLubyte *procName,
-                                                  char ***function_names,
-                                                  char **parameter_signature);
-typedef void (*__GLdestroyVendorDataCallback)(void *vendorData);
-
-/* Opaque dispatch table structure. */
-typedef struct __GLdispatchTableRec __GLdispatchTable;
-
 /* Namespaces for API state */
 enum {
     GLDISPATCH_API_GLX,
     GLDISPATCH_API_EGL
 };
+
+/*!
+ * This opaque structure describes the core GL dispatch table.
+ */
+typedef struct __GLdispatchTableRec __GLdispatchTable;
+
+typedef void (*__GLdispatchProc)(void);
+
+typedef void *(*__GLgetProcAddressCallback)(const char *procName, void *param);
+
+/**
+ * An opaque structure used for internal API state data.
+ */
+struct __GLdispatchAPIStatePrivateRec;
 
 /*!
  * Generic API state structure. The window system binding API libraries subclass
@@ -83,32 +83,82 @@ enum {
  * a context current). This is done to conserve TLS space.
  */
 typedef struct __GLdispatchAPIStateRec {
+    /*************************************************************************
+     * Winsys-managed variables: fixed for lifetime of state
+     *************************************************************************/
+
     /*!
      * Namespace of the state: either API_GLX or API_EGL
      */
     int tag;
 
-    /*!
-     * Unique identifier for the state within the namespace. Usually (pointer
-     * to) thread id
+    /**
+     * A callback that is called when a thread that has a current context
+     * terminates.
+     *
+     * This is called after libGLdispatch handles its cleanup, so
+     * __glDispatchGetCurrentAPIState will return NULL. The API state is passed
+     * as a parameter instead.
+     *
+     * The callback should not call __glDispatchMakeCurrent or
+     * __glDispatchLoseCurrent.
+     *
+     * \param apiState The API state passed to __glDispatchMakeCurrent.
      */
-    void *id;
+    void (*threadDestroyedCallback)(struct __GLdispatchAPIStateRec *apiState);
+
+    /*************************************************************************
+     * GLdispatch-managed variables: Modified by MakeCurrent()
+     *************************************************************************/
 
     /*!
-     * The current (high-level) __GLdispatch table
+     * Private data for this API state.
+     *
+     * This structure is assigned in \c __glDispatchMakeCurrent, and freed in
+     * \c __glDispatchLoseCurrent.
+     *
+     * The value of this pointer, if any, is an internal detail of
+     * libGLdispatch. The window system library should just ignore it.
      */
-    __GLdispatchTable *dispatch;
-
-    /*!
-     * The current (vendor-specific) GL context
-     */
-    void *context;
+    struct __GLdispatchAPIStatePrivateRec *priv;
 } __GLdispatchAPIState;
+
+/*!
+ * Gets the version number for the ABI between libGLdispatch and the
+ * window-system libraries.
+ *
+ * The current version (which libGLX checks for) is \c GLDISPATCH_ABI_VERSION.
+ *
+ * Note that this only defines the interface between the libGLdispatch and a
+ * window-system library such as libGLX. The interface between libGLX and a
+ * vendor library still uses \c GLX_VENDOR_ABI_VERSION for its version number.
+ *
+ * This function can (and generally should) be called before
+ * \c __glDispatchInit.
+ */
+PUBLIC int __glDispatchGetABIVersion(void);
 
 /*!
  * Initialize GLdispatch with pthreads functions needed for locking.
  */
-PUBLIC void __glDispatchInit(GLVNDPthreadFuncs *funcs);
+PUBLIC void __glDispatchInit(void);
+
+/*!
+ * Tears down GLdispatch state.
+ */
+PUBLIC void __glDispatchFini(void);
+
+/*!
+ * Called when the client library has detected a fork, and GLdispatch state
+ * needs to be reset to handle the fork.
+ */
+PUBLIC void __glDispatchReset(void);
+
+/*!
+ * This returns a process-unique ID that is suitable for use with a new GL
+ * vendor.
+ */
+PUBLIC int __glDispatchNewVendorID(void);
 
 /*!
  * Get a dispatch stub suitable for returning to the application from
@@ -121,21 +171,14 @@ PUBLIC __GLdispatchProc __glDispatchGetProcAddress(const char *procName);
  * client GLX or EGL context, and is passed into GLdispatch during make current.
  * A dispatch table is owned by a particular vendor.
  *
- * \param [in] getProcAddress a vendor library callback GLdispatch can use to
+ * \param[in] getProcAddress a vendor library callback GLdispatch can use to
  * query addresses of functions from the vendor. This callback also takes
- * a pointer to vendor-private data.
- * \param [in] getDispatchProto a vendor library callback GLdispatch can use to
- * query prototypes of functions it doesn't know about from the vendor.
- * \param [in] destroyVendorData a vendor library callback to destroy private
- * data when the dispatch table is destroyed.
- * \param [in] vendorData a pointer to vendor library private data, which can
- * be used by the getProcAddress callback.
+ * a pointer to caller-private data.
+ * \param[in] param A pointer to pass to \p getProcAddress.
  */
 PUBLIC __GLdispatchTable *__glDispatchCreateTable(
     __GLgetProcAddressCallback getProcAddress,
-    __GLgetDispatchProtoCallback getDispatchProto,
-    __GLdestroyVendorDataCallback destroyVendorData,
-    void *vendorData
+    void *param
 );
 
 /*!
@@ -144,14 +187,34 @@ PUBLIC __GLdispatchTable *__glDispatchCreateTable(
 PUBLIC void __glDispatchDestroyTable(__GLdispatchTable *dispatch);
 
 /*!
- * This makes the given API state current, and sets the current dispatch
- * table and context based on the settings in the API state.
+ * This makes the given API state current, and assigns this API state
+ * the passed-in current dispatch table and vendor ID.
+ *
+ * When this function is called, the current thread must not already have an
+ * API state. To switch between two API states, first release the old API state
+ * by calling \c __glDispatchLoseCurrent.
+ *
+ * If patchCb is not NULL, GLdispatch will attempt to overwrite its
+ * entrypoints (and the entrypoints of any loaded interface libraries)
+ * using the provided callbacks.  If patchCb is NULL and the entrypoints
+ * have been previously overwritten, GLdispatch will attempt to restore
+ * the default libglvnd entrypoints.
+ *
+ * This returns GL_FALSE if the make current operation failed, and GL_TRUE
+ * if it succeeded.
  */
-PUBLIC void __glDispatchMakeCurrent(__GLdispatchAPIState *apiState);
+PUBLIC GLboolean __glDispatchMakeCurrent(__GLdispatchAPIState *apiState,
+                                         __GLdispatchTable *dispatch,
+                                         int vendorID,
+                                         const __GLdispatchPatchCallbacks *patchCb);
 
 /*!
- * This makes the NOP dispatch table current and sets the current context and
- * API state to NULL.
+ * This makes the NOP dispatch table current and sets the current API state to
+ * NULL.
+ *
+ * A window system library should only call this if it created the current API
+ * state. That is, if libGLX should not attempt to release an EGL context or
+ * vice-versa.
  */
 PUBLIC void __glDispatchLoseCurrent(void);
 
@@ -159,38 +222,13 @@ PUBLIC void __glDispatchLoseCurrent(void);
  * This gets the current (opaque) API state pointer. If the pointer is
  * NULL, no context is current, otherwise the contents of the pointer depends on
  * which client API owns the context (EGL or GLX).
- *
- * This currently just hijacks _glapi_{set,get}_context() for this purpose.
  */
-static inline __GLdispatchAPIState *__glDispatchGetCurrentAPIState(void)
-{
-    return _glapi_get_current(CURRENT_API_STATE);
-}
+PUBLIC __GLdispatchAPIState *__glDispatchGetCurrentAPIState(void);
 
-/*!
- * This gets the current (opaque) vendor library context pointer. If the pointer
- * is NULL, no context is current, otherwsise the contents of the pointer
- * depends on the vendor whose context is current.
+/**
+ * Checks to see if multiple threads are being used. This should be called
+ * periodically from places like glXMakeCurrent.
  */
-static inline void *__glDispatchGetCurrentContext(void)
-{
-    return _glapi_get_current(CURRENT_CONTEXT);
-}
-
-/*!
- * This gets the "offset" of the given entrypoint in the GL dispatch table
- * structure, or -1 if there was an error.  This is technically an opaque handle
- * which can be passed into __glDispatchSetEntry() later, but in practice
- * describes a real offset.  If the call succeeds, the offset remains valid for
- * the lifetime of libglvnd for all GL dispatch tables used by libglvnd.
- */
-PUBLIC GLint __glDispatchGetOffset(const char *procName);
-
-/*!
- * This sets the dispatch table entry given by <offset> to the entrypoint
- * address given by <addr>.
- */
-PUBLIC void __glDispatchSetEntry(__GLdispatchTable *dispatch,
-                                 GLint offset, __GLdispatchProc addr);
+PUBLIC void __glDispatchCheckMultithreaded(void);
 
 #endif

@@ -37,32 +37,35 @@
 #include "libglxmapping.h"
 #include "libglxnoop.h"
 #include "GLdispatch.h"
-#include "uthash.h"
+#include "lkdhash.h"
+#include "glvnd_list.h"
 
 /*
- * Define current API library state here. An API state is per-thread, per-winsys
- * library. Due to this definition libGLX's state could always be "current",
- * though in practice (to conserve TLS space) only up to one API library's state
- * is current at a time. Hence, the __GLXAPIState may or may not be in TLS
- * (depending on whether GLX has a context current at the time).
+ * Define current API library state here.
+ *
+ * A thread will have a __GLXAPIState struct if and only if it has a current
+ * GLX context. If we don't have a current context, then there's nothing useful
+ * to store in it.
+ *
+ * The pointer to the current __GLXAPIState is stored in libGLdispatch, since
+ * it's also the current __GLdispatchAPIState struct.
  */
 typedef struct __GLXAPIStateRec {
     __GLdispatchAPIState glas; /* Must be the first entry! */
 
+    __GLXvendorInfo *currentVendor;
+
     Display *currentDisplay;
     GLXDrawable currentDraw;
     GLXDrawable currentRead;
-    const __GLXdispatchTableStatic *currentStaticDispatch;
-    __GLXdispatchTableDynamic *currentDynDispatch;
-    __GLXvendorInfo *currentVendor;
-    UT_hash_handle hh;
-} __GLXAPIState;
+    GLXContext currentContext;
 
-/*!
- * This is a fallback function in the case where the API library is not in
- * TLS, to look up the API state given the current thread id.
- */
-__GLXAPIState *__glXGetAPIState(glvnd_thread_t tid);
+    // TODO: If we free the API state when we don't have a current context,
+    // then we don't really need the hash for anything. A linked list would
+    // be fine, and would probably be simpler.
+    //UT_hash_handle hh;
+    struct glvnd_list entry;
+} __GLXAPIState;
 
 /*!
  * This attempts to pull the current API state from TLS, and falls back to
@@ -71,15 +74,12 @@ __GLXAPIState *__glXGetAPIState(glvnd_thread_t tid);
 static inline __GLXAPIState *__glXGetCurrentAPIState(void)
 {
     __GLdispatchAPIState *glas = __glDispatchGetCurrentAPIState();
-    __GLXAPIState *state;
     if (unlikely(!glas ||
                  (glas->tag != GLDISPATCH_API_GLX))) {
-        state = __glXGetAPIState(__glXPthreadFuncs.self());
+        return NULL;
     } else {
-        state = (__GLXAPIState *)(glas);
+        return (__GLXAPIState *)(glas);
     }
-
-    return state;
 }
 
 /*!
@@ -90,8 +90,7 @@ static inline const __GLXdispatchTableStatic *__glXGetCurrentDispatch(void)
 {
     __GLXAPIState *apiState = __glXGetCurrentAPIState();
     if (likely(apiState)) {
-        return apiState->currentStaticDispatch ?
-               apiState->currentStaticDispatch : __glXDispatchNoopPtr;
+        return &apiState->currentVendor->staticDispatch;
     } else {
         return __glXDispatchNoopPtr;
     }
@@ -101,7 +100,7 @@ static inline const __GLXdispatchTableStatic *__glXGetCurrentDispatch(void)
  * This gets the current GLX dynamic dispatch table, which is stored in the API
  * state.
  */
-__GLXdispatchTableDynamic *__glXGetCurrentDynDispatch(void);
+__GLXvendorInfo *__glXGetCurrentDynDispatch(void);
 
 /*!
  * This gets the current (vendor-specific) context, which is stored directly
@@ -109,7 +108,12 @@ __GLXdispatchTableDynamic *__glXGetCurrentDynDispatch(void);
  */
 static inline GLXContext __glXGetCurrentContext(void)
 {
-    return (GLXContext)__glDispatchGetCurrentContext();
+    __GLXAPIState *apiState = __glXGetCurrentAPIState();
+    if (apiState != NULL) {
+        return apiState->currentContext;
+    } else {
+        return NULL;
+    }
 }
 
 #endif // !defined(__LIB_GLX_TLS)

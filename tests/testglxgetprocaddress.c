@@ -45,15 +45,6 @@
     (*p_ ## proc) args;                                         \
 } while (0)
 
-#define CHECK_PROC_XFAIL(proc) do {                             \
-    printf("checking " #proc "\n");                             \
-    if ((p_ ## proc =                                           \
-         (PTR_ ## proc)glXGetProcAddress((GLubyte *)#proc))) {  \
-        printf("got unexpected " #proc "!\n");                  \
-        goto fail;                                              \
-    }                                                           \
-} while (0)
-
 PROC_DEFINES(void *, glXGetProcAddress, (GLubyte *procName));
 PROC_DEFINES(void, glXWaitGL, (void));
 PROC_DEFINES(void, glVertex3fv, (GLfloat *v));
@@ -61,10 +52,11 @@ PROC_DEFINES(void, glXExampleExtensionFunction,
              (Display *dpy, int screen, int *retval));
 PROC_DEFINES(void, glBogusFunc1, (int a, int b, int c));
 PROC_DEFINES(void, glBogusFunc2, (int a, int b, int c));
-PROC_DEFINES(void, OogaBooga, (int a, int b, int c));
 
 int main(int argc, char **argv)
 {
+    Display *dpy = NULL;
+
     int retval = 0;
     /*
      * Try GetProcAddress on different classes of API functions, and bogus
@@ -72,6 +64,12 @@ int main(int argc, char **argv)
      * any function beginning with gl*(), though bogus functions will resolve
      * to no-ops.
      */
+
+    dpy = XOpenDisplay(NULL);
+    if (dpy == NULL) {
+        printf("Can't open display\n");
+        goto fail;
+    }
 
     /*
      * Test core GLX dispatch functions implemented by API library. This
@@ -87,7 +85,7 @@ int main(int argc, char **argv)
      * (a zero value indicates we might be calling into a no-op stub generated
      * by libGLdispatch).
      */
-    CHECK_PROC(glXExampleExtensionFunction, (NULL, 0, &retval));
+    CHECK_PROC(glXExampleExtensionFunction, (dpy, DefaultScreen(dpy), &retval));
 
     if (!retval) {
         printf("Unexpected glXExampleExtensionFunction() return value!\n");
@@ -112,11 +110,6 @@ int main(int argc, char **argv)
      */
     CHECK_PROC(glBogusFunc1, (0, 0, 0));
     CHECK_PROC(glBogusFunc2, (1, 1, 1));
-
-    /*
-     * This will return NULL since OogaBooga is not prefixed with "gl".
-     */
-    CHECK_PROC_XFAIL(OogaBooga);
 
     // Success!
     return 0;

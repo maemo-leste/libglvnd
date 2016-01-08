@@ -31,30 +31,47 @@
  * Copied from main/execmem.c and simplified for dispatch stubs.
  */
 
+#include <stdlib.h>
+#include <stdint.h>
 
 #include "u_compiler.h"
 #include "u_thread.h"
 #include "u_execmem.h"
+#include "utils_misc.h"
 
 
-#define EXEC_MAP_SIZE (4*1024)
+/*
+ * Allocate 64 bytes for each stub so that they're large enough to hold the
+ * x86-64 TSD stubs. The x86 TSD and x86-64 TLS stubs both take 32 bytes each.
+ *
+ * The x86-64 TSD stubs are larger than the others because it has to deal with
+ * 64-bit addresses and preserving the function arguments.
+ *
+ * The generated stubs may not be within 2GB of u_current or
+ * u_current_get_internal, so we can't use RIP-relative addressing for them.
+ * Instead we have to use movabs instructions to load the 64-bit absolute
+ * addresses, which take 10 bytes each.
+ *
+ * In addition, x86-64 passes the first 6 parameters in registers, which the
+ * callee does not have to preserve. Since the stub has to pass those same
+ * parameters to the real function, we have to preserve them across the call to
+ * u_current_get_internal. Pushing and popping those registers takes another 24
+ * bytes.
+ */
+#define EXEC_MAP_SIZE (64*4096) // DISPATCH_FUNCTION_SIZE * MAPI_TABLE_NUM_DYNAMIC
 
 u_mutex_declare_static(exec_mutex);
 
 static unsigned int head = 0;
 
-static unsigned char *exec_mem = (unsigned char *)0;
+static unsigned char *exec_mem = NULL;
+static unsigned char *write_mem = NULL;
 
 
 #if defined(__linux__) || defined(__OpenBSD__) || defined(_NetBSD__) || defined(__sun) || defined(__HAIKU__)
 
 #include <unistd.h>
 #include <sys/mman.h>
-
-#ifdef MESA_SELINUX
-#include <selinux/selinux.h>
-#endif
-
 
 #ifndef MAP_ANONYMOUS
 #define MAP_ANONYMOUS MAP_ANON
@@ -69,21 +86,26 @@ static unsigned char *exec_mem = (unsigned char *)0;
 static int
 init_map(void)
 {
-#ifdef MESA_SELINUX
-   if (is_selinux_enabled()) {
-      if (!security_get_boolean_active("allow_execmem") ||
-	  !security_get_boolean_pending("allow_execmem"))
-         return 0;
-   }
-#endif
+    if (exec_mem == NULL) {
+        void *writePtr, *execPtr;
+        if (AllocExecPages(EXEC_MAP_SIZE, &writePtr, &execPtr) == 0) {
+            exec_mem = (unsigned char *) execPtr;
+            write_mem = (unsigned char *) writePtr;
+            head = 0;
+        }
+    }
 
-   if (!exec_mem)
-      exec_mem = mmap(NULL, EXEC_MAP_SIZE, PROT_EXEC | PROT_READ | PROT_WRITE,
-		      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-   return (exec_mem != MAP_FAILED);
+    return (exec_mem != NULL);
 }
 
+void u_execmem_free(void)
+{
+    if (exec_mem != NULL) {
+        FreeExecPages(EXEC_MAP_SIZE, write_mem, exec_mem);
+        write_mem = NULL;
+        exec_mem = NULL;
+    }
+}
 
 #elif defined(_WIN32)
 
@@ -98,6 +120,7 @@ static int
 init_map(void)
 {
    exec_mem = VirtualAlloc(NULL, EXEC_MAP_SIZE, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+   write_mem = exec_mem;
 
    return (exec_mem != NULL);
 }
@@ -111,6 +134,7 @@ static int
 init_map(void)
 {
    exec_mem = malloc(EXEC_MAP_SIZE);
+   write_mem = exec_mem;
 
    return (exec_mem != NULL);
 }
@@ -142,4 +166,18 @@ bail:
    return addr;
 }
 
+void *u_execmem_get_writable(void *execPtr)
+{
+    // If execPtr is within the executable mapping, then return the same offset
+    // in the writable mapping.
+    if (((uintptr_t) execPtr) >= ((uintptr_t) exec_mem))
+    {
+        uintptr_t offset = ((uintptr_t) execPtr) - ((uintptr_t) exec_mem);
+        if (offset < EXEC_MAP_SIZE)
+        {
+            return (void *) (((uintptr_t) write_mem) + offset);
+        }
+    }
+    return execPtr;
+}
 

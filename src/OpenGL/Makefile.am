@@ -27,22 +27,17 @@
 
 lib_LTLIBRARIES = libOpenGL.la
 
-libOpenGL_la_SOURCES = \
-	OpenGL.c           \
-	glapitemp.h
+ENTRYPOINT_TARGET=opengl
+include $(top_srcdir)/src/OpenGL/entrypoint_common.mk
 
-BUILT_SOURCES = glapitemp.h
-CLEANFILES = $(BUILT_SOURCES)
+libOpenGL_la_SOURCES = $(ENTRYPOINT_COMMON_FILES)
 
-TOP = $(top_srcdir)
-GLAPI = $(top_srcdir)/$(MAPI_PREFIX)/glapi
-include $(GLAPI)/gen/glapi_gen.mk
+libOpenGL_la_CFLAGS = $(ENTRYPOINT_COMMON_CFLAGS)
 
-glapitemp.h : $(GLAPI)/gen/gl_and_es_API.xml $(glapi_gen_mapi_deps)
-	$(call glapi_gen_mapi,$<,noop-gl)
+EXTRA_libOpenGL_la_DEPENDENCIES = $(ENTRYPOINT_COMMON_DEPENDENCIES)
 
-libOpenGL_la_CFLAGS = \
-	-I$(top_srcdir)/include
+libOpenGL_la_LDFLAGS = $(ENTRYPOINT_COMMON_LDFLAGS) \
+	-version-info 0
 
-libOpenGL_la_LDFLAGS = -shared -Wl,--auxiliary=libGLdispatch.so.0
+libOpenGL_la_LIBADD = $(ENTRYPOINT_COMMON_LIBADD)
 

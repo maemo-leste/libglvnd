@@ -27,6 +27,7 @@
 
 noinst_HEADERS = \
 	GLdispatch.h \
+	GLdispatchABI.h \
 	GLdispatchPrivate.h
 
 lib_LTLIBRARIES = libGLdispatch.la
@@ -34,15 +35,26 @@ lib_LTLIBRARIES = libGLdispatch.la
 SUBDIRS = vnd-glapi
 
 libGLdispatch_la_CFLAGS =  -I$(srcdir)/vnd-glapi/mapi/glapi
+libGLdispatch_la_CFLAGS += -I$(top_srcdir)/src/util
 libGLdispatch_la_CFLAGS += -I$(top_srcdir)/src/util/trace
 libGLdispatch_la_CFLAGS += -I$(top_srcdir)/src/util/glvnd_pthread
 libGLdispatch_la_CFLAGS += -I$(srcdir)/vnd-glapi/mapi
 libGLdispatch_la_CFLAGS += -I$(top_srcdir)/include
 
-libGLdispatch_la_LDFLAGS = -shared
+libGLdispatch_la_LDFLAGS = -shared -version-info 0 $(LINKER_FLAG_NO_UNDEFINED)
+
+if USE_DT_AUXILIARY
+else
+EXTRA_libGLdispatch_la_DEPENDENCIES = $(top_srcdir)/src/GLdispatch/export_list.sym
+libGLdispatch_la_LDFLAGS += \
+	-export-symbols $(top_srcdir)/src/GLdispatch/export_list.sym
+endif
 
 libGLdispatch_la_SOURCES = \
 	GLdispatch.c
 
 libGLdispatch_la_LIBADD = vnd-glapi/libglapi.la
 libGLdispatch_la_LIBADD += ../util/trace/libtrace.la
+libGLdispatch_la_LIBADD += ../util/glvnd_pthread/libglvnd_pthread.la
+
+EXTRA_DIST = export_list.sym

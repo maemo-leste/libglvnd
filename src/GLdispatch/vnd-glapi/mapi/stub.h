@@ -29,11 +29,19 @@
 #define _STUB_H_
 
 #include "entry.h"
+#include "glapi/glapi.h"
 
 struct mapi_stub;
 
-void
-stub_init_once(void);
+#if !defined(STATIC_DISPATCH_ONLY)
+
+/**
+ * Frees any memory that was allocated for any dynamic stub functions.
+ *
+ * This should only be called when the library is unloaded, since any generated
+ * functions won't work after this.
+ */
+void stub_cleanup_dynamic(void);
 
 const struct mapi_stub *
 stub_find_public(const char *name);
@@ -44,9 +52,6 @@ stub_find_dynamic(const char *name, int generate);
 const struct mapi_stub *
 stub_find_by_slot(int slot);
 
-void
-stub_fix_dynamic(struct mapi_stub *stub, const struct mapi_stub *alias);
-
 const char *
 stub_get_name(const struct mapi_stub *stub);
 
@@ -55,5 +60,12 @@ stub_get_slot(const struct mapi_stub *stub);
 
 mapi_func
 stub_get_addr(const struct mapi_stub *stub);
+#endif // !defined(STATIC_DISPATCH_ONLY)
+
+/**
+ * Returns the \c __GLdispatchStubPatchCallbacks struct that should be used for
+ * patching the entrypoints, or \c NULL if patching is not supported.
+ */
+const __GLdispatchStubPatchCallbacks *stub_get_patch_callbacks(void);
 
 #endif /* _STUB_H_ */

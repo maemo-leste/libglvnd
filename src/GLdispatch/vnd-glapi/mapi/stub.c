@@ -30,41 +30,37 @@
 #include <assert.h>
 
 #include "u_current.h"
-#include "u_thread.h"
 #include "entry.h"
 #include "stub.h"
 #include "table.h"
 
+#if !defined(STATIC_DISPATCH_ONLY)
+#include "u_execmem.h"
+#endif
+
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
+#define MAPI_LAST_SLOT (MAPI_TABLE_NUM_STATIC + MAPI_TABLE_NUM_DYNAMIC - 1)
 
 struct mapi_stub {
-   const void *name;
+   /*!
+    * The name of a static stub function. This isn't really a pointer, it's an
+    * offset into public_string_pool.
+    */
+   const void *nameOffset;
+
    int slot;
    mapi_func addr;
+
+   /**
+    * The name of the function. This is only used for dynamic stubs. For static
+    * stubs, nameOffset is used instead.
+    */
+   char *nameBuffer;
 };
 
 /* define public_string_pool and public_stubs */
 #define MAPI_TMP_PUBLIC_STUBS
 #include "mapi_tmp.h"
-
-static struct mapi_stub dynamic_stubs[MAPI_TABLE_NUM_DYNAMIC];
-static int num_dynamic_stubs;
-static int next_dynamic_slot = MAPI_TABLE_NUM_STATIC;
-
-void
-stub_init_once(void)
-{
-#ifdef HAVE_PTHREAD
-   static pthread_once_t once = PTHREAD_ONCE_INIT;
-   pthread_once(&once, entry_patch_public);
-#else
-   static int first = 1;
-   if (first) {
-      first = 0;
-      entry_patch_public();
-   }
-#endif
-}
 
 static int
 stub_compare(const void *key, const void *elem)
@@ -73,7 +69,7 @@ stub_compare(const void *key, const void *elem)
    const struct mapi_stub *stub = (const struct mapi_stub *) elem;
    const char *stub_name;
 
-   stub_name = &public_string_pool[(unsigned long) stub->name];
+   stub_name = &public_string_pool[(unsigned long) stub->nameOffset];
 
    return strcmp(name, stub_name);
 }
@@ -84,8 +80,32 @@ stub_compare(const void *key, const void *elem)
 const struct mapi_stub *
 stub_find_public(const char *name)
 {
+   /* Public entry points are stored without their 'gl' prefix */
+   if (name[0] == 'g' && name[1] == 'l') {
+       name += 2;
+   }
+
    return (const struct mapi_stub *) bsearch(name, public_stubs,
          ARRAY_SIZE(public_stubs), sizeof(public_stubs[0]), stub_compare);
+}
+
+#if !defined(STATIC_DISPATCH_ONLY)
+static struct mapi_stub dynamic_stubs[MAPI_TABLE_NUM_DYNAMIC];
+static int num_dynamic_stubs;
+
+void stub_cleanup_dynamic(void)
+{
+    int i;
+
+    // Free the copies of the stub names.
+    for (i=0; i<num_dynamic_stubs; i++) {
+        struct mapi_stub *stub = &dynamic_stubs[i];
+        free(stub->nameBuffer);
+        stub->nameBuffer = NULL;
+    }
+
+    num_dynamic_stubs = 0;
+    u_execmem_free();
 }
 
 /**
@@ -104,15 +124,24 @@ stub_add_dynamic(const char *name)
 
    stub = &dynamic_stubs[idx];
 
-   /* dispatch to the last slot, which is reserved for no-op */
-   stub->addr = entry_generate(
-         MAPI_TABLE_NUM_STATIC + MAPI_TABLE_NUM_DYNAMIC - 1);
-   if (!stub->addr)
-      return NULL;
+   /*
+    * name is the pointer passed to glXGetProcAddress, so the caller may free
+    * or modify it later. Allocate a copy of the name to store.
+    */
+   stub->nameBuffer = strdup(name);
+   if (stub->nameBuffer == NULL) {
+       return NULL;
+   }
 
-   stub->name = (const void *) name;
-   /* to be fixed later */
-   stub->slot = -1;
+   stub->nameOffset = NULL;
+   /* Assign the next unused slot. */
+   stub->slot = MAPI_TABLE_NUM_STATIC + idx;
+   stub->addr = entry_generate(stub->slot);
+   if (!stub->addr) {
+      free(stub->nameBuffer);
+      stub->nameBuffer = NULL;
+      return NULL;
+   }
 
    num_dynamic_stubs = idx + 1;
 
@@ -126,18 +155,15 @@ stub_add_dynamic(const char *name)
 struct mapi_stub *
 stub_find_dynamic(const char *name, int generate)
 {
-   u_mutex_declare_static(dynamic_mutex);
    struct mapi_stub *stub = NULL;
    int count, i;
    
-   u_mutex_lock(dynamic_mutex);
-
    if (generate)
       assert(!stub_find_public(name));
 
    count = num_dynamic_stubs;
    for (i = 0; i < count; i++) {
-      if (strcmp(name, (const char *) dynamic_stubs[i].name) == 0) {
+      if (strcmp(name, (const char *) dynamic_stubs[i].nameBuffer) == 0) {
          stub = &dynamic_stubs[i];
          break;
       }
@@ -146,8 +172,6 @@ stub_find_dynamic(const char *name, int generate)
    /* generate a dynamic stub */
    if (generate && !stub)
          stub = stub_add_dynamic(name);
-
-   u_mutex_unlock(dynamic_mutex);
 
    return stub;
 }
@@ -173,23 +197,7 @@ stub_find_by_slot(int slot)
       return stub;
    return search_table_by_slot(dynamic_stubs, num_dynamic_stubs, slot);
 }
-
-void
-stub_fix_dynamic(struct mapi_stub *stub, const struct mapi_stub *alias)
-{
-   int slot;
-
-   if (stub->slot >= 0)
-      return;
-
-   if (alias)
-      slot = alias->slot;
-   else
-      slot = next_dynamic_slot++;
-
-   entry_patch(stub->addr, slot);
-   stub->slot = slot;
-}
+#endif // !defined(STATIC_DISPATCH_ONLY)
 
 /**
  * Return the name of a stub.
@@ -200,10 +208,11 @@ stub_get_name(const struct mapi_stub *stub)
    const char *name;
 
    if (stub >= public_stubs &&
-       stub < public_stubs + ARRAY_SIZE(public_stubs))
-      name = &public_string_pool[(unsigned long) stub->name];
-   else
-      name = (const char *) stub->name;
+       stub < public_stubs + ARRAY_SIZE(public_stubs)) {
+      name = &public_string_pool[(unsigned long) stub->nameOffset];
+   } else {
+      name = stub->nameBuffer;
+   }
 
    return name;
 }
@@ -224,5 +233,142 @@ mapi_func
 stub_get_addr(const struct mapi_stub *stub)
 {
    assert(stub->addr || (unsigned int) stub->slot < MAPI_TABLE_NUM_STATIC);
-   return (stub->addr) ? stub->addr : entry_get_public(stub->slot);
+   if (stub->addr != NULL)
+   {
+      return stub->addr;
+   }
+   else
+   {
+      int index = stub - public_stubs;
+      return entry_get_public(index);
+   }
 }
+
+static int stub_allow_override(void)
+{
+    return !!entry_stub_size;
+}
+
+static GLboolean stubStartPatch(void)
+{
+    if (!stub_allow_override()) {
+        return GL_FALSE;
+    }
+
+    if (!entry_patch_start()) {
+        return GL_FALSE;
+    }
+
+    return GL_TRUE;
+}
+
+static void stubFinishPatch(void)
+{
+    entry_patch_finish();
+}
+
+static void stubRestoreFuncsInternal(void)
+{
+    int i, slot;
+    const struct mapi_stub *stub;
+
+    assert(stub_allow_override());
+
+    for (stub = public_stubs, i = 0;
+         i < ARRAY_SIZE(public_stubs);
+         stub++, i++) {
+        slot = (stub->slot == -1) ? MAPI_LAST_SLOT : stub->slot;
+        entry_generate_default_code((char *)stub_get_addr(stub), slot);
+    }
+
+#if !defined(STATIC_DISPATCH_ONLY)
+    for (stub = dynamic_stubs, i = 0;
+         i < num_dynamic_stubs;
+         stub++, i++) {
+        slot = (stub->slot == -1) ? MAPI_LAST_SLOT : stub->slot;
+        entry_generate_default_code((char *)stub_get_addr(stub), slot);
+    }
+#endif // !defined(STATIC_DISPATCH_ONLY)
+}
+
+static GLboolean stubRestoreFuncs(void)
+{
+    if (entry_patch_start()) {
+        stubRestoreFuncsInternal();
+        entry_patch_finish();
+        return GL_TRUE;
+    } else {
+        return GL_FALSE;
+    }
+}
+
+static void stubAbortPatch(void)
+{
+    stubRestoreFuncsInternal();
+    entry_patch_finish();
+}
+
+static GLboolean stubGetPatchOffset(const char *name, void **writePtr, const void **execPtr)
+{
+    const struct mapi_stub *stub;
+    void *writeAddr = NULL;
+    const void *execAddr = NULL;
+
+    stub = stub_find_public(name);
+
+#if !defined(STATIC_DISPATCH_ONLY)
+    if (!stub) {
+        stub = stub_find_dynamic(name, 0);
+    }
+#endif // !defined(STATIC_DISPATCH_ONLY)
+
+    if (stub) {
+        mapi_func addr = stub_get_addr(stub);
+        if (addr != NULL) {
+            entry_get_patch_addresses(addr, &writeAddr, &execAddr);
+        }
+    }
+
+    if (writePtr != NULL) {
+        *writePtr = writeAddr;
+    }
+    if (execPtr != NULL) {
+        *execPtr = execAddr;
+    }
+
+    return ((writeAddr != NULL && execAddr != NULL) ? GL_TRUE : GL_FALSE);
+}
+
+static int stubGetStubType(void)
+{
+    return entry_type;
+}
+
+static int stubGetStubSize(void)
+{
+    return entry_stub_size;
+}
+
+static const __GLdispatchStubPatchCallbacks stubPatchCallbacks =
+{
+    stubStartPatch,     // startPatch
+    stubFinishPatch,    // finishPatch
+    stubAbortPatch,     // abortPatch
+    stubRestoreFuncs,   // restoreFuncs
+    stubGetPatchOffset, // getPatchOffset
+    stubGetStubType,    // getStubType
+    stubGetStubSize,    // getStubSize
+};
+
+const __GLdispatchStubPatchCallbacks *stub_get_patch_callbacks(void)
+{
+    if (stub_allow_override())
+    {
+        return &stubPatchCallbacks;
+    }
+    else
+    {
+        return NULL;
+    }
+}
+

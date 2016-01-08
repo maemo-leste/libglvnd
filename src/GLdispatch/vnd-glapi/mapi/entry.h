@@ -32,16 +32,77 @@
 
 typedef void (*mapi_func)(void);
 
+enum {
+    ENTRY_X86_TLS,
+    ENTRY_X86_64_TLS,
+    ENTRY_X86_TSD,
+    ENTRY_PURE_C,
+    ENTRY_X86_64_TSD,
+    ENTRY_ARMV7_THUMB_TSD,
+    ENTRY_NUM_TYPES
+};
+
+extern const int entry_type;
+extern const int entry_stub_size;
+
 void
-entry_patch_public(void);
+entry_init_public(void);
 
+/**
+ * Returns the address of an entrypoint.
+ *
+ * Note that \p index is the index into the array of public stubs, not the slot
+ * in the dispatch table. The public stub array may be different depending on
+ * which library is being built. For example, the array in libOpenGL.so is a
+ * subset of the array in libGLdispatch.so.
+ *
+ * \param index The index into the public stub table.
+ * \return A pointer to the function, suitable to hand back from
+ * glX/eglGetProcAddress.
+ */
 mapi_func
-entry_get_public(int slot);
+entry_get_public(int index);
 
+/**
+ * Generates an entrypoint for an extension function.
+ *
+ * This will allocate executable memory and generate an entrypoint function.
+ * This is used to dispatch any OpenGL functions that are not known at compile
+ * time.
+ *
+ * \param slot The slot in the dispatch table.
+ * \return A newly generated entrypoint function, or NULL on failure.
+ */
 mapi_func
 entry_generate(int slot);
 
 void
-entry_patch(mapi_func entry, int slot);
+entry_generate_default_code(char *entry, int slot);
+
+/**
+ * Called before starting entrypoint patching.
+ *
+ * This function will generally call mprotect(2) to make the static entrypoints
+ * writable.
+ *
+ * \return Non-zero on success, zero on failure.
+ */
+int entry_patch_start(void);
+
+/**
+ * Called after the vendor library finishes patching the entrypoints.
+ *
+ * \return Non-zero on success, zero on failure.
+ */
+int entry_patch_finish(void);
+
+/**
+ * Returns the addresses for an entrypoint that a vendor library can patch.
+ *
+ * \param[in] entry The entrypoint to patch.
+ * \param[out] writePtr The address that the vendor library can write to.
+ * \param[out] execPtr An executable mapping of \p writePtr.
+ */
+void entry_get_patch_addresses(mapi_func entry, void **writePtr, const void **execPtr);
 
 #endif /* _ENTRY_H_ */
