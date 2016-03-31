@@ -24,11 +24,14 @@
  */
 
 #include "u_current.h"
-#include "u_thread.h"
+
+#include <stdio.h>
+#include <stdlib.h>
 #include <assert.h>
 
 #include "table.h"
 #include "stub.h"
+#include "glvnd_pthread.h"
 
 const void *_glapi_Current[GLAPI_NUM_CURRENT_ENTRIES]
     = {
@@ -43,7 +46,7 @@ u_current_init(void)
 {
     int i;
     for (i = 0; i < GLAPI_NUM_CURRENT_ENTRIES; i++) {
-        if (pthreadFuncs.key_create(&u_current_tsd[i], NULL) != 0) {
+        if (__glvndPthreadFuncs.key_create(&u_current_tsd[i], NULL) != 0) {
             perror("_glthread_: failed to allocate key for thread specific data");
             abort();
         }
@@ -57,7 +60,7 @@ u_current_destroy(void)
 {
     int i;
     for (i = 0; i < GLAPI_NUM_CURRENT_ENTRIES; i++) {
-        pthreadFuncs.key_delete(u_current_tsd[i]);
+        __glvndPthreadFuncs.key_delete(u_current_tsd[i]);
     }
 }
 
@@ -74,7 +77,7 @@ u_current_set_multithreaded(void)
 
 void u_current_set(const struct _glapi_table *tbl)
 {
-    if (pthreadFuncs.setspecific(u_current_tsd[GLAPI_CURRENT_DISPATCH], (void *) tbl) != 0) {
+    if (__glvndPthreadFuncs.setspecific(u_current_tsd[GLAPI_CURRENT_DISPATCH], (void *) tbl) != 0) {
         perror("_glthread_: thread failed to set thread specific data");
         abort();
     }
@@ -84,6 +87,6 @@ void u_current_set(const struct _glapi_table *tbl)
 const struct _glapi_table *u_current_get(void)
 {
    return (const struct _glapi_table *) ((ThreadSafe) ?
-         pthreadFuncs.getspecific(u_current_tsd[GLAPI_CURRENT_DISPATCH]) : _glapi_Current[GLAPI_CURRENT_DISPATCH]);
+         __glvndPthreadFuncs.getspecific(u_current_tsd[GLAPI_CURRENT_DISPATCH]) : _glapi_Current[GLAPI_CURRENT_DISPATCH]);
 }
 

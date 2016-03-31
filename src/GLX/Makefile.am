@@ -26,33 +26,30 @@
 # MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
 
 noinst_HEADERS = \
-	libglxabi.h \
 	libglxabipriv.h \
 	libglxcurrent.h \
 	libglxmapping.h \
 	libglxnoop.h \
 	libglxgl.h \
 	libglxstring.h \
-	libglxthread.h
+	libglxthread.h \
+	libglxproto.h
 
 lib_LTLIBRARIES = libGLX.la
 
 UTIL_DIR = ../util
 TRACE_DIR = ../util/trace
-GLVND_PTHREAD_DIR = ../util/glvnd_pthread
 UTHASH_DIR = ../util/uthash/src
 GL_DISPATCH_DIR = ../GLdispatch
-X11GLVND_DIR = ../x11glvnd
 
 # Warning settings
 # Include paths
 libGLX_la_CFLAGS =  -I$(srcdir)/$(UTHASH_DIR)
 libGLX_la_CFLAGS += -I$(srcdir)/$(UTIL_DIR)
 libGLX_la_CFLAGS += -I$(srcdir)/$(TRACE_DIR)
-libGLX_la_CFLAGS += -I$(srcdir)/$(GLVND_PTHREAD_DIR)
 libGLX_la_CFLAGS += -I$(srcdir)/$(GL_DISPATCH_DIR)
 libGLX_la_CFLAGS += -I$(top_srcdir)/include
-libGLX_la_CFLAGS += -I$(srcdir)/$(X11GLVND_DIR)
+libGLX_la_CFLAGS += $(GLPROTO_CFLAGS)
 
 # Required library flags
 libGLX_la_CFLAGS += $(PTHREAD_CFLAGS)
@@ -62,13 +59,13 @@ libGLX_la_LIBADD = -ldl
 libGLX_la_LIBADD += $(X11_LIBS)
 libGLX_la_LIBADD += $(XEXT_LIBS)
 libGLX_la_LIBADD += $(GL_DISPATCH_DIR)/libGLdispatch.la
-libGLX_la_LIBADD += $(X11GLVND_DIR)/libx11glvnd_client.la
 libGLX_la_LIBADD += $(TRACE_DIR)/libtrace.la
-libGLX_la_LIBADD += $(GLVND_PTHREAD_DIR)/libglvnd_pthread.la
 
 libGLX_la_LDFLAGS = -shared -Wl,-Bsymbolic -version-info 0 $(LINKER_FLAG_NO_UNDEFINED)
 
 BUILT_SOURCES = g_libglxnoop.c
+
+CLEANFILES = $(BUILT_SOURCES)
 
 EXTRA_DIST = gen_stubs.pl glx_funcs.spec
 
@@ -76,9 +73,11 @@ g_libglxnoop.c : gen_stubs.pl glx_funcs.spec
 	$(AM_V_GEN)$(PERL) $(srcdir)/gen_stubs.pl "noop" $(srcdir)/glx_funcs.spec > $@
 
 libGLX_la_SOURCES = \
+	$(top_srcdir)/src/util/glvnd_pthread.c \
 	libglx.c \
 	libglxmapping.c \
 	libglxstring.c \
+	libglxproto.c \
 	$(UTIL_DIR)/glvnd_genentry.c \
 	$(UTIL_DIR)/utils_misc.c \
 	g_libglxnoop.c

@@ -27,8 +27,6 @@
  * MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
  */
 
-#define _GNU_SOURCE 1
-
 #include <string.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -39,6 +37,7 @@
 #include "GLdispatchPrivate.h"
 #include "stub.h"
 #include "glvnd_pthread.h"
+#include "app_error_check.h"
 
 /*
  * Global current dispatch table list. We need this to fix up all current
@@ -53,11 +52,6 @@ static struct glvnd_list currentDispatchList;
 static int clientRefcount;
 
 /*
- * Threading imports used for locking.
- */
-GLVNDPthreadFuncs pthreadFuncs;
-
-/*
  * The number of current contexts that GLdispatch is aware of
  */
 static int numCurrentContexts;
@@ -65,16 +59,16 @@ static int numCurrentContexts;
 /**
  * Private data for each API state.
  */
-typedef struct __GLdispatchAPIStatePrivateRec {
+typedef struct __GLdispatchThreadStatePrivateRec {
     /// A pointer back to the API state.
-    __GLdispatchAPIState *apiState;
+    __GLdispatchThreadState *threadState;
 
     /// ID of the current vendor for this state
     int vendorID;
 
     /// The current (high-level) __GLdispatch table
     __GLdispatchTable *dispatch;
-} __GLdispatchAPIStatePrivate;
+} __GLdispatchThreadStatePrivate;
 
 typedef struct __GLdispatchProcEntryRec {
     char *procName;
@@ -138,11 +132,11 @@ static GLint64 dispatchStubListGeneration;
 static int firstUnusedVendorID = 1;
 
 /**
- * The key used to store the __GLdispatchAPIState for the current thread.
+ * The key used to store the __GLdispatchThreadState for the current thread.
  */
 static glvnd_key_t threadContextKey;
 
-static void SetCurrentAPIState(__GLdispatchAPIState *apiState);
+static void SetCurrentThreadState(__GLdispatchThreadState *threadState);
 static void ThreadDestroyed(void *data);
 static int RegisterStubCallbacks(const __GLdispatchStubPatchCallbacks *callbacks);
 
@@ -174,14 +168,14 @@ struct {
 
 static inline void LockDispatch(void)
 {
-    pthreadFuncs.mutex_lock(&dispatchLock.lock);
+    __glvndPthreadFuncs.mutex_lock(&dispatchLock.lock);
     dispatchLock.isLocked = 1;
 }
 
 static inline void UnlockDispatch(void)
 {
     dispatchLock.isLocked = 0;
-    pthreadFuncs.mutex_unlock(&dispatchLock.lock);
+    __glvndPthreadFuncs.mutex_unlock(&dispatchLock.lock);
 }
 
 #define CheckDispatchLocked() assert(dispatchLock.isLocked)
@@ -199,7 +193,8 @@ void _init(void)
 {
     // Here, we only initialize the pthreads imports. Everything else we'll
     // deal with in __glDispatchInit.
-    glvndSetupPthreads(RTLD_DEFAULT, &pthreadFuncs);
+    glvndSetupPthreads();
+    glvndAppErrorCheckInit();
 }
 
 void __glDispatchInit(void)
@@ -209,7 +204,7 @@ void __glDispatchInit(void)
     if (clientRefcount == 0) {
         // Initialize the GLAPI layer.
         _glapi_init();
-        pthreadFuncs.key_create(&threadContextKey, ThreadDestroyed);
+        __glvndPthreadFuncs.key_create(&threadContextKey, ThreadDestroyed);
 
         glvnd_list_init(&extProcList);
         glvnd_list_init(&currentDispatchList);
@@ -421,6 +416,11 @@ static inline int PatchingIsDisabledByEnvVar(void)
         char *disallowPatchStr = getenv("__GLVND_DISALLOW_PATCHING");
         if (disallowPatchStr) {
             disallowPatch = atoi(disallowPatchStr);
+        } else if (glvndAppErrorCheckGetEnabled()) {
+            // Entrypoint rewriting means skipping the dispatch table in
+            // libGLdispatch, which would disable checking for calling OpenGL
+            // functions without a context.
+            disallowPatch = GL_TRUE;
         }
         inited = GL_TRUE;
     }
@@ -430,7 +430,7 @@ static inline int PatchingIsDisabledByEnvVar(void)
 
 static inline int ContextIsCurrentInAnyOtherThread(void)
 {
-    int thisThreadsContext = !!__glDispatchGetCurrentAPIState();
+    int thisThreadsContext = !!__glDispatchGetCurrentThreadState();
     int otherContexts;
 
     CheckDispatchLocked();
@@ -570,14 +570,16 @@ static int PatchEntrypoints(
     if (stubCurrentPatchCb) {
         // Notify the previous vendor that it no longer owns these
         // entrypoints.
-        stubCurrentPatchCb->releasePatch();
+        if (stubCurrentPatchCb->releasePatch != NULL) {
+            stubCurrentPatchCb->releasePatch();
+        }
     }
 
     if (patchCb) {
         GLboolean anySuccess = GL_FALSE;
 
         glvnd_list_for_each_entry(stub, &dispatchStubList, entry) {
-            if (patchCb->checkPatchSupported(stub->callbacks.getStubType(),
+            if (patchCb->isPatchSupported(stub->callbacks.getStubType(),
                         stub->callbacks.getStubSize()))
             {
                 if (stub->callbacks.startPatch()) {
@@ -623,19 +625,19 @@ static int PatchEntrypoints(
     return 1;
 }
 
-PUBLIC GLboolean __glDispatchMakeCurrent(__GLdispatchAPIState *apiState,
+PUBLIC GLboolean __glDispatchMakeCurrent(__GLdispatchThreadState *threadState,
                                          __GLdispatchTable *dispatch,
                                          int vendorID,
                                          const __GLdispatchPatchCallbacks *patchCb)
 {
-    __GLdispatchAPIStatePrivate *priv;
+    __GLdispatchThreadStatePrivate *priv;
 
-    if (__glDispatchGetCurrentAPIState() != NULL) {
+    if (__glDispatchGetCurrentThreadState() != NULL) {
         assert(!"__glDispatchMakeCurrent called with a current API state\n");
         return GL_FALSE;
     }
 
-    priv = (__GLdispatchAPIStatePrivate *) malloc(sizeof(__GLdispatchAPIStatePrivate));
+    priv = (__GLdispatchThreadStatePrivate *) malloc(sizeof(__GLdispatchThreadStatePrivate));
     if (priv == NULL) {
         return GL_FALSE;
     }
@@ -677,61 +679,61 @@ PUBLIC GLboolean __glDispatchMakeCurrent(__GLdispatchAPIState *apiState,
      */
     priv->dispatch = dispatch;
     priv->vendorID = vendorID;
-    priv->apiState = apiState;
-    apiState->priv = priv;
+    priv->threadState = threadState;
+    threadState->priv = priv;
 
     /*
      * Set the current state in TLS.
      */
-    SetCurrentAPIState(apiState);
+    SetCurrentThreadState(threadState);
     _glapi_set_current(dispatch->table);
 
     return GL_TRUE;
 }
 
-static void LoseCurrentInternal(__GLdispatchAPIState *curApiState,
+static void LoseCurrentInternal(__GLdispatchThreadState *curThreadState,
         GLboolean threadDestroyed)
 {
     LockDispatch();
     // Try to restore the libglvnd default stubs, if possible.
     PatchEntrypoints(NULL, 0);
 
-    if (curApiState) {
+    if (curThreadState) {
         numCurrentContexts--;
-        if (curApiState->priv != NULL) {
-            if (curApiState->priv->dispatch != NULL) {
-                DispatchCurrentUnref(curApiState->priv->dispatch);
+        if (curThreadState->priv != NULL) {
+            if (curThreadState->priv->dispatch != NULL) {
+                DispatchCurrentUnref(curThreadState->priv->dispatch);
             }
 
-            free(curApiState->priv);
-            curApiState->priv = NULL;
+            free(curThreadState->priv);
+            curThreadState->priv = NULL;
         }
     }
     UnlockDispatch();
 
     if (!threadDestroyed) {
-        SetCurrentAPIState(NULL);
+        SetCurrentThreadState(NULL);
         _glapi_set_current(NULL);
     }
 }
 
 PUBLIC void __glDispatchLoseCurrent(void)
 {
-    __GLdispatchAPIState *curApiState = __glDispatchGetCurrentAPIState();
-    if (curApiState == NULL) {
+    __GLdispatchThreadState *curThreadState = __glDispatchGetCurrentThreadState();
+    if (curThreadState == NULL) {
         return;
     }
-    LoseCurrentInternal(curApiState, GL_FALSE);
+    LoseCurrentInternal(curThreadState, GL_FALSE);
 }
 
-__GLdispatchAPIState *__glDispatchGetCurrentAPIState(void)
+__GLdispatchThreadState *__glDispatchGetCurrentThreadState(void)
 {
-    return (__GLdispatchAPIState *) pthreadFuncs.getspecific(threadContextKey);
+    return (__GLdispatchThreadState *) __glvndPthreadFuncs.getspecific(threadContextKey);
 }
 
-void SetCurrentAPIState(__GLdispatchAPIState *apiState)
+void SetCurrentThreadState(__GLdispatchThreadState *threadState)
 {
-    pthreadFuncs.setspecific(threadContextKey, apiState);
+    __glvndPthreadFuncs.setspecific(threadContextKey, threadState);
 }
 
 /*
@@ -742,7 +744,7 @@ void __glDispatchReset(void)
     __GLdispatchTable *cur, *tmp;
 
     /* Reset the dispatch lock */
-    pthreadFuncs.mutex_init(&dispatchLock.lock, NULL);
+    __glvndPthreadFuncs.mutex_init(&dispatchLock.lock, NULL);
     dispatchLock.isLocked = 0;
 
     LockDispatch();
@@ -757,7 +759,7 @@ void __glDispatchReset(void)
     UnlockDispatch();
 
     /* Clear GLAPI TLS entries. */
-    SetCurrentAPIState(NULL);
+    SetCurrentThreadState(NULL);
     _glapi_set_current(NULL);
 }
 
@@ -797,7 +799,7 @@ void __glDispatchFini(void)
             free(curProc);
         }
 
-        pthreadFuncs.key_delete(threadContextKey);
+        __glvndPthreadFuncs.key_delete(threadContextKey);
 
         // Clean up GLAPI thread state
         _glapi_destroy();
@@ -808,30 +810,46 @@ void __glDispatchFini(void)
 
 void __glDispatchCheckMultithreaded(void)
 {
-    if (!pthreadFuncs.is_singlethreaded)
+    if (!__glvndPthreadFuncs.is_singlethreaded)
     {
+        // Check to see if the current thread has a dispatch table assigned to
+        // it, and if it doesn't, then plug in the no-op table.
+        // This is a partial workaround to broken applications that try to call
+        // OpenGL functions without a current context, without adding any
+        // additional overhead to the dispatch stubs themselves. As long as the
+        // thread calls at least one GLX function first, any OpenGL calls will
+        // go to the no-op stubs instead of crashing.
+        if (_glapi_get_current() == NULL) {
+            // Calling _glapi_set_current(NULL) will plug in the no-op table.
+            _glapi_set_current(NULL);
+        }
+
         LockDispatch();
         if (!isMultiThreaded) {
-            glvnd_thread_t tid = pthreadFuncs.self();
-            if (pthreadFuncs.equal(firstThreadId, GLVND_THREAD_NULL)) {
+            glvnd_thread_t tid = __glvndPthreadFuncs.self();
+            if (__glvndPthreadFuncs.equal(firstThreadId, GLVND_THREAD_NULL)) {
                 firstThreadId = tid;
-            } else if (!pthreadFuncs.equal(firstThreadId, tid)) {
+            } else if (!__glvndPthreadFuncs.equal(firstThreadId, tid)) {
                 isMultiThreaded = 1;
                 _glapi_set_multithread();
             }
         }
         UnlockDispatch();
+
+        if (stubCurrentPatchCb != NULL && stubCurrentPatchCb->threadAttach != NULL) {
+            stubCurrentPatchCb->threadAttach();
+        }
     }
 }
 
 void ThreadDestroyed(void *data)
 {
     if (data != NULL) {
-        __GLdispatchAPIState *apiState = (__GLdispatchAPIState *) data;
-        LoseCurrentInternal(apiState, GL_TRUE);
+        __GLdispatchThreadState *threadState = (__GLdispatchThreadState *) data;
+        LoseCurrentInternal(threadState, GL_TRUE);
 
-        if (apiState->threadDestroyedCallback != NULL) {
-            apiState->threadDestroyedCallback(apiState);
+        if (threadState->threadDestroyedCallback != NULL) {
+            threadState->threadDestroyedCallback(threadState);
         }
     }
 }

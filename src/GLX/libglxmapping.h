@@ -36,8 +36,6 @@
 
 #define GLX_CLIENT_STRING_LAST_ATTRIB GLX_EXTENSIONS
 
-typedef struct __GLXdispatchTableDynamicRec __GLXdispatchTableDynamic;
-
 /*!
  * Structure containing relevant per-vendor information.
  */
@@ -45,10 +43,14 @@ struct __GLXvendorInfoRec {
     int vendorID; //< unique GLdispatch ID
     char *name; //< name of the vendor
     void *dlhandle; //< shared library handle
-    __GLXdispatchTableDynamic *dynDispatch; //< dynamic GLX dispatch table
+
+    /// dynamic GLX dispatch table
+    DEFINE_LKDHASH(struct __GLXdispatchFuncHashRec, dynDispatchHash);
+
     __GLdispatchTable *glDispatch; //< GL dispatch table
 
     const __GLXapiImports *glxvc;
+    const __GLdispatchPatchCallbacks *patchCallbacks;
     __GLXdispatchTableStatic staticDispatch; //< static GLX dispatch table
 };
 
@@ -58,6 +60,8 @@ typedef struct __GLXvendorXIDMappingHashRec __GLXvendorXIDMappingHash;
  * Structure containing per-display information.
  */
 typedef struct __GLXdisplayInfoRec {
+    Display *dpy;
+
     char *clientStrings[GLX_CLIENT_STRING_LAST_ATTRIB];
 
     /**
@@ -77,9 +81,7 @@ typedef struct __GLXdisplayInfoRec {
     int glxMajorOpcode;
     int glxFirstError;
 
-    Bool x11glvndSupported;
-    int x11glvndMajor;
-    int x11glvndMinor;
+    Bool libglvndExtensionSupported;
 } __GLXdisplayInfo;
 
 /*!
@@ -97,21 +99,17 @@ __GLdispatchTable *__glXGetGLDispatch(Display *dpy, const int screen);
  * Various functions to manage mappings used to determine the screen
  * of a particular GLX call.
  */
-void __glXAddVendorContextMapping(Display *dpy, GLXContext context, __GLXvendorInfo *vendor);
+int __glXAddVendorContextMapping(Display *dpy, GLXContext context, __GLXvendorInfo *vendor);
 void __glXRemoveVendorContextMapping(Display *dpy, GLXContext context);
-int __glXVendorFromContext(GLXContext context, __GLXvendorInfo **retVendor);
+__GLXvendorInfo *__glXVendorFromContext(GLXContext context);
 
-void __glXAddVendorFBConfigMapping(Display *dpy, GLXFBConfig config, __GLXvendorInfo *vendor);
+int __glXAddVendorFBConfigMapping(Display *dpy, GLXFBConfig config, __GLXvendorInfo *vendor);
 void __glXRemoveVendorFBConfigMapping(Display *dpy, GLXFBConfig config);
-int __glXVendorFromFBConfig(Display *dpy, GLXFBConfig config, __GLXvendorInfo **retVendor);
+__GLXvendorInfo *__glXVendorFromFBConfig(Display *dpy, GLXFBConfig config);
 
-void __glXAddScreenVisualMapping(Display *dpy, const XVisualInfo *visual, __GLXvendorInfo *vendor);
-void __glXRemoveScreenVisualMapping(Display *dpy, const XVisualInfo *visual);
-int __glXVendorFromVisual(Display *dpy, const XVisualInfo *visual, __GLXvendorInfo **retVendor);
-
-void __glXAddVendorDrawableMapping(Display *dpy, GLXDrawable drawable, __GLXvendorInfo *vendor);
+int __glXAddVendorDrawableMapping(Display *dpy, GLXDrawable drawable, __GLXvendorInfo *vendor);
 void __glXRemoveVendorDrawableMapping(Display *dpy, GLXDrawable drawable);
-int __glXVendorFromDrawable(Display *dpy, GLXDrawable drawable, __GLXvendorInfo **retVendor);
+__GLXvendorInfo *__glXVendorFromDrawable(Display *dpy, GLXDrawable drawable);
 
 __GLXextFuncPtr __glXGetGLXDispatchAddress(const GLubyte *procName);
 __GLXextFuncPtr __glXGenerateGLXEntrypoint(const GLubyte *procName);
@@ -130,14 +128,10 @@ __GLXvendorInfo *__glXLookupVendorByScreen(Display *dpy, const int screen);
 __GLXdisplayInfo *__glXLookupDisplay(Display *dpy);
 
 /*!
- * Frees the __GLXdisplayInfo structure for a display, if one exists.
+ * This is called to perform any context-related cleanup when a display is
+ * closed.
  */
-void __glXFreeDisplay(Display *dpy);
-
-/*!
- * Notifies libglvnd that a context has been marked for destruction.
- */
-void __glXNotifyContextDestroyed(GLXContext ctx);
+void __glXDisplayClosed(__GLXdisplayInfo *dpyInfo);
 
 /*
  * Close the vendor library and perform any relevant teardown. This should

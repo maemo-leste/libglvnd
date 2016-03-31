@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, NVIDIA CORPORATION.
+ * Copyright (c) 2016, NVIDIA CORPORATION.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and/or associated documentation files (the
@@ -27,11 +27,55 @@
  * MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
  */
 
-#ifndef __LIBGLX_THREAD_H__
-#define __LIBGLX_THREAD_H__
+#include "app_error_check.h"
 
-#include "glvnd_pthread.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 
-void __glXThreadInitialize(void);
+static int errorCheckingEnabled = 0;
+static int reportAppErrorsEnabled = 0;
+static int abortOnAppError = 0;
 
-#endif
+void glvndAppErrorCheckInit(void)
+{
+    const char *env;
+
+    env = getenv("__GLVND_APP_ERROR_CHECKING");
+    if (env != NULL) {
+        errorCheckingEnabled = (atoi(env) != 0 ? 1 : 0);
+        if (errorCheckingEnabled) {
+            reportAppErrorsEnabled = 1;
+            abortOnAppError = 1;
+        }
+    }
+
+    env = getenv("__GLVND_ABORT_ON_APP_ERROR");
+    if (env != NULL) {
+        abortOnAppError = (atoi(env) != 0 ? 1 : 0);
+        if (abortOnAppError) {
+            reportAppErrorsEnabled = 1;
+        }
+    }
+}
+
+void glvndAppErrorCheckReportError(const char *format, ...)
+{
+    if (reportAppErrorsEnabled) {
+        va_list args;
+        va_start(args, format);
+        vfprintf(stderr, format, args);
+        va_end(args);
+        fflush(stderr);
+
+        if (abortOnAppError) {
+            abort();
+        }
+    }
+}
+
+int glvndAppErrorCheckGetEnabled(void)
+{
+    return errorCheckingEnabled;
+}
+

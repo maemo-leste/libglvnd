@@ -27,9 +27,6 @@
  * MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
  */
 
-/* For RTLD_DEFAULT on x86 systems */
-#define _GNU_SOURCE 1
-
 #include <X11/Xlib.h>
 #include <X11/Xlibint.h>
 #include <X11/Xproto.h>
@@ -46,7 +43,6 @@
 #include "utils_misc.h"
 #include "trace.h"
 #include "GL/glxproto.h"
-#include "x11glvnd.h"
 #include "libglxgl.h"
 #include "glvnd_list.h"
 
@@ -57,34 +53,83 @@
 #define GLX_MINOR_VERSION 4
 #define GLX_VERSION_STRING "1.4"
 
-GLVNDPthreadFuncs __glXPthreadFuncs;
-
 static glvnd_mutex_t clientStringLock = GLVND_MUTEX_INITIALIZER;
 
-/*
- * Hashtable tracking current contexts for the purpose of determining whether
- * glXDestroyContext() should remove the context -> screen mapping immediately,
- * or defer this until the context loses current.
+/**
+ * This structure keeps track of a rendering context.
+ *
+ * It's used both to keep track of which vendor owns each context and for
+ * whether a context is current to any thread.
  */
-typedef struct __GLXcurrentContextHashRec {
-    GLXContext ctx;
-    Bool needsUnmap;
+struct __GLXcontextInfoRec {
+    GLXContext context;
+    __GLXvendorInfo *vendor;
+    int currentCount;
+    Bool deleted;
     UT_hash_handle hh;
-} __GLXcurrentContextHash;
+};
 
-static __GLXcurrentContextHash *currentContextHash = NULL;
-static pthread_mutex_t currentContextHashLock;
+static __GLXcontextInfo *glxContextHash = NULL;
 
 /**
- * A list of current __GLXAPIState structures. This is used so that we can
+ * The mutex used to protect the \c glxContextHash hash. Any thread must
+ * take this mutex before it accesses the \c glxContextHash, or before it
+ * modifies any field in a __GLXcontextInfo structure.
+ *
+ * Note that a \c __GLXcontextInfo struct will stay valid for as long as a context
+ * is. That is, it's only freed when the context is deleted and no longer
+ * current to any thread.
+ *
+ * Also note that the \c context and \c vendor values are never modified for
+ * the life of the structure. Thus, it's safe to access them for the current
+ * thread's current context without having to take the \c glxContextHashLock
+ * mutex.
+ */
+static glvnd_mutex_t glxContextHashLock;
+
+/**
+ * A list of current __GLXThreadState structures. This is used so that we can
  * clean up at process termination or after a fork.
  */
-static struct glvnd_list currentAPIStateList;
-static glvnd_mutex_t currentAPIStateListMutex = PTHREAD_MUTEX_INITIALIZER;
+static struct glvnd_list currentThreadStateList;
+static glvnd_mutex_t currentThreadStateListMutex = GLVND_MUTEX_INITIALIZER;
 
-static __GLXAPIState *CreateAPIState(__GLXvendorInfo *vendor);
-static void DestroyAPIState(__GLXAPIState *apiState);
-static Bool UpdateCurrentContext(GLXContext newCtx, GLXContext oldCtx);
+static __GLXThreadState *CreateThreadState(__GLXvendorInfo *vendor);
+static void DestroyThreadState(__GLXThreadState *threadState);
+
+/*!
+ * Updates the current context.
+ *
+ * If the old context was flagged for deletion and is no longer current to any
+ * thread, then it will also remove the context from the context hashtable.
+ *
+ * \note glxContextHashLock must be locked before calling this
+ * function.
+ *
+ * \param[in] newCtxInfo The new context to make current, or \c NULL to just
+ * release the current context.
+ * \param[in] oldCtxInfo The previous current context, or \c NULL if no context
+ * was current before.
+ */
+static void UpdateCurrentContext(__GLXcontextInfo *newCtxInfo, __GLXcontextInfo *oldCtxInfo);
+
+/**
+ * Removes and frees an entry from the glxContextHash table.
+ *
+ * The caller must take the \c glxContextHashLock mutex before calling this
+ * function.
+ *
+ * \param ctx The context to free.
+ */
+static void FreeContextInfo(__GLXcontextInfo *ctx);
+
+/**
+ * Checks whether a rendering context should be deleted.
+ *
+ * If the context is marked for deletion, and is not current to any thread,
+ * then it will remove and free the __GLXcontextInfo struct.
+ */
+static void CheckContextDeleted(__GLXcontextInfo *ctx);
 
 static void __glXSendError(Display *dpy, unsigned char errorCode,
         XID resourceID, unsigned char minorCode, Bool coreX11error);
@@ -117,7 +162,7 @@ static __GLXvendorInfo *CommonDispatchDrawable(Display *dpy, GLXDrawable draw,
 
     if (draw != None) {
         __glXThreadInitialize();
-        __glXVendorFromDrawable(dpy, draw, &vendor);
+        vendor = __glXVendorFromDrawable(dpy, draw);
     }
     if (vendor == NULL) {
         __glXSendError(dpy, errorCode, draw, minorCode, coreX11error);
@@ -132,7 +177,7 @@ static __GLXvendorInfo *CommonDispatchContext(Display *dpy, GLXContext context,
 
     if (context != NULL) {
         __glXThreadInitialize();
-        __glXVendorFromContext(context, &vendor);
+        vendor = __glXVendorFromContext(context);
     }
     if (vendor == NULL) {
         __glXSendError(dpy, GLXBadContext, 0, minorCode, False);
@@ -147,7 +192,7 @@ static __GLXvendorInfo *CommonDispatchFBConfig(Display *dpy, GLXFBConfig config,
 
     if (config != NULL) {
         __glXThreadInitialize();
-        __glXVendorFromFBConfig(dpy, config, &vendor);
+        vendor = __glXVendorFromFBConfig(dpy, config);
     }
     if (vendor == NULL) {
         __glXSendError(dpy, GLXBadFBConfig, 0, minorCode, False);
@@ -192,7 +237,10 @@ PUBLIC GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis,
     vendor = __glXLookupVendorByScreen(dpy, vis->screen);
     if (vendor != NULL) {
         GLXContext context = vendor->staticDispatch.createContext(dpy, vis, share_list, direct);
-        __glXAddVendorContextMapping(dpy, context, vendor);
+        if (__glXAddVendorContextMapping(dpy, context, vendor) != 0) {
+            vendor->staticDispatch.destroyContext(dpy, context);
+            context = NULL;
+        }
         return context;
     } else {
         return NULL;
@@ -209,7 +257,10 @@ PUBLIC GLXContext glXCreateNewContext(Display *dpy, GLXFBConfig config,
     if (vendor != NULL) {
         context = vendor->staticDispatch.createNewContext(dpy, config, render_type,
                                                      share_list, direct);
-        __glXAddVendorContextMapping(dpy, context, vendor);
+        if (__glXAddVendorContextMapping(dpy, context, vendor) != 0) {
+            vendor->staticDispatch.destroyContext(dpy, context);
+            context = NULL;
+        }
     }
     return context;
 }
@@ -218,7 +269,7 @@ PUBLIC void glXDestroyContext(Display *dpy, GLXContext context)
 {
     __GLXvendorInfo *vendor = CommonDispatchContext(dpy, context, X_GLXDestroyContext);
     if (vendor != NULL) {
-        __glXNotifyContextDestroyed(context);
+        __glXRemoveVendorContextMapping(dpy, context);
         vendor->staticDispatch.destroyContext(dpy, context);
     }
 }
@@ -361,9 +412,13 @@ static GLXContext glXImportContextEXT(Display *dpy, GLXContextID contextID)
     }
 
     vendor = __glXLookupVendorByScreen(dpy, screen);
-    if (vendor != NULL && vendor->staticDispatch.importContextEXT != NULL) {
+    if (vendor != NULL && vendor->staticDispatch.importContextEXT != NULL
+            && vendor->staticDispatch.freeContextEXT) {
         GLXContext context = vendor->staticDispatch.importContextEXT(dpy, contextID);
-        __glXAddVendorContextMapping(dpy, context, vendor);
+        if (__glXAddVendorContextMapping(dpy, context, vendor) != 0) {
+            vendor->staticDispatch.freeContextEXT(dpy, context);
+            context = NULL;
+        }
         return context;
     } else {
         return NULL;
@@ -376,9 +431,9 @@ static void glXFreeContextEXT(Display *dpy, GLXContext context)
 
     __glXThreadInitialize();
 
-    __glXVendorFromContext(context, &vendor);
+    vendor = __glXVendorFromContext(context);
     if (vendor != NULL && vendor->staticDispatch.freeContextEXT != NULL) {
-        __glXNotifyContextDestroyed(context);
+        __glXRemoveVendorContextMapping(dpy, context);
         vendor->staticDispatch.freeContextEXT(dpy, context);
     }
 }
@@ -393,7 +448,10 @@ PUBLIC GLXPixmap glXCreateGLXPixmap(Display *dpy, XVisualInfo *vis, Pixmap pixma
     vendor = __glXLookupVendorByScreen(dpy, vis->screen);
     if (vendor != NULL) {
         GLXPixmap pmap = vendor->staticDispatch.createGLXPixmap(dpy, vis, pixmap);
-        __glXAddVendorDrawableMapping(dpy, pmap, vendor);
+        if (__glXAddVendorDrawableMapping(dpy, pmap, vendor) != 0) {
+            vendor->staticDispatch.destroyGLXPixmap(dpy, pmap);
+            pmap = None;
+        }
         return pmap;
     } else {
         return None;
@@ -431,7 +489,16 @@ PUBLIC GLXContext glXGetCurrentContext(void)
 {
     __glXThreadInitialize();
 
-    return __glXGetCurrentContext();
+    __GLXThreadState *threadState = __glXGetCurrentThreadState();
+    if (threadState != NULL) {
+        // The current thread has a thread state pointer if and only if it has a
+        // current context, and the currentContext pointer is assigned before
+        // the threadState pointer is put into TLS, so it will never be NULL.
+        assert(threadState->currentContext != NULL);
+        return threadState->currentContext->context;
+    } else {
+        return NULL;
+    }
 }
 
 
@@ -439,9 +506,9 @@ PUBLIC GLXDrawable glXGetCurrentDrawable(void)
 {
     __glXThreadInitialize();
 
-    __GLXAPIState *apiState = __glXGetCurrentAPIState();
-    if (apiState != NULL) {
-        return apiState->currentDraw;
+    __GLXThreadState *threadState = __glXGetCurrentThreadState();
+    if (threadState != NULL) {
+        return threadState->currentDraw;
     } else {
         return None;
     }
@@ -451,9 +518,9 @@ PUBLIC GLXDrawable glXGetCurrentReadDrawable(void)
 {
     __glXThreadInitialize();
 
-    __GLXAPIState *apiState = __glXGetCurrentAPIState();
-    if (apiState != NULL) {
-        return apiState->currentRead;
+    __GLXThreadState *threadState = __glXGetCurrentThreadState();
+    if (threadState != NULL) {
+        return threadState->currentRead;
     } else {
         return None;
     }
@@ -463,9 +530,9 @@ PUBLIC Display *glXGetCurrentDisplay(void)
 {
     __glXThreadInitialize();
 
-    __GLXAPIState *apiState = __glXGetCurrentAPIState();
-    if (apiState != NULL) {
-        return apiState->currentDisplay;
+    __GLXThreadState *threadState = __glXGetCurrentThreadState();
+    if (threadState != NULL) {
+        return threadState->currentDisplay;
     } else {
         return NULL;
     }
@@ -473,10 +540,12 @@ PUBLIC Display *glXGetCurrentDisplay(void)
 
 __GLXvendorInfo *__glXGetCurrentDynDispatch(void)
 {
-    __GLXAPIState *apiState = __glXGetCurrentAPIState();
+    __glXThreadInitialize();
 
-    if (apiState != NULL) {
-        return apiState->currentVendor;
+    __GLXThreadState *threadState = __glXGetCurrentThreadState();
+
+    if (threadState != NULL) {
+        return threadState->currentVendor;
     } else {
         return NULL;
     }
@@ -492,75 +561,71 @@ PUBLIC Bool glXIsDirect(Display *dpy, GLXContext context)
     }
 }
 
-void DisplayClosed(Display *dpy)
+void __glXDisplayClosed(__GLXdisplayInfo *dpyInfo)
 {
-    __GLXAPIState *apiState;
-    __glXFreeDisplay(dpy);
+    __GLXThreadState *threadState;
 
-    apiState = __glXGetCurrentAPIState();
-    if (apiState != NULL && apiState->currentDisplay == dpy) {
+    threadState = __glXGetCurrentThreadState();
+    if (threadState != NULL && threadState->currentDisplay == dpyInfo->dpy) {
         // Clear out the current context, but don't call into the vendor
         // library or do anything that might require a valid display.
         __glDispatchLoseCurrent();
-        __glXPthreadFuncs.mutex_lock(&currentContextHashLock);
-        UpdateCurrentContext(NULL, apiState->currentContext);
-        __glXPthreadFuncs.mutex_unlock(&currentContextHashLock);
-        DestroyAPIState(apiState);
+        __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
+        UpdateCurrentContext(NULL, threadState->currentContext);
+        __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
+        DestroyThreadState(threadState);
     }
 
-    __glXPthreadFuncs.mutex_lock(&currentAPIStateListMutex);
-    glvnd_list_for_each_entry(apiState, &currentAPIStateList, entry) {
+    __glvndPthreadFuncs.mutex_lock(&currentThreadStateListMutex);
+    glvnd_list_for_each_entry(threadState, &currentThreadStateList, entry) {
         /*
-         * Stub out any references to this display in any other API states.
+         * Stub out any references to this display in any other thread states.
          */
-        if (apiState->currentDisplay == dpy) {
-            apiState->currentDisplay = NULL;
+        if (threadState->currentDisplay == dpyInfo->dpy) {
+            threadState->currentDisplay = NULL;
         }
     }
-    __glXPthreadFuncs.mutex_unlock(&currentAPIStateListMutex);
+    __glvndPthreadFuncs.mutex_unlock(&currentThreadStateListMutex);
 }
 
-static void ThreadDestroyed(__GLdispatchAPIState *apiState)
+static void ThreadDestroyed(__GLdispatchThreadState *threadState)
 {
-    __GLXAPIState *glxState = (__GLXAPIState *) apiState;
+    __GLXThreadState *glxState = (__GLXThreadState *) threadState;
 
-    /*
-     * If a GLX context is current in this thread, remove it from the
-     * current context hash before destroying the thread.
-     */
-    __glXPthreadFuncs.mutex_lock(&currentContextHashLock);
+    // Clear out the current context.
+    __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
     UpdateCurrentContext(NULL, glxState->currentContext);
-    __glXPthreadFuncs.mutex_unlock(&currentContextHashLock);
+    __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
 
-    // Free the API state struct.
-    DestroyAPIState(glxState);
+    // Free the thread state struct.
+    DestroyThreadState(glxState);
 }
 
-static __GLXAPIState *CreateAPIState(__GLXvendorInfo *vendor)
+static __GLXThreadState *CreateThreadState(__GLXvendorInfo *vendor)
 {
-    __GLXAPIState *apiState = calloc(1, sizeof(*apiState));
+    __GLXThreadState *threadState = calloc(1, sizeof(*threadState));
 
-    assert(apiState);
+    assert(threadState);
 
-    apiState->glas.tag = GLDISPATCH_API_GLX;
-    apiState->glas.threadDestroyedCallback = ThreadDestroyed;
-    apiState->currentVendor = vendor;
+    threadState->glas.tag = GLDISPATCH_API_GLX;
+    threadState->glas.threadDestroyedCallback = ThreadDestroyed;
+    threadState->currentVendor = vendor;
 
-    __glXPthreadFuncs.mutex_lock(&currentAPIStateListMutex);
-    glvnd_list_add(&apiState->entry, &currentAPIStateList);
-    __glXPthreadFuncs.mutex_unlock(&currentAPIStateListMutex);
+    __glvndPthreadFuncs.mutex_lock(&currentThreadStateListMutex);
+    glvnd_list_add(&threadState->entry, &currentThreadStateList);
+    __glvndPthreadFuncs.mutex_unlock(&currentThreadStateListMutex);
 
-    return apiState;
+    return threadState;
 }
 
-static void DestroyAPIState(__GLXAPIState *apiState)
+static void DestroyThreadState(__GLXThreadState *threadState)
 {
-    // Free the API state struct.
-    __glXPthreadFuncs.mutex_lock(&currentAPIStateListMutex);
-    glvnd_list_del(&apiState->entry);
-    __glXPthreadFuncs.mutex_unlock(&currentAPIStateListMutex);
+    // Free the thread state struct.
+    __glvndPthreadFuncs.mutex_lock(&currentThreadStateListMutex);
+    glvnd_list_del(&threadState->entry);
+    __glvndPthreadFuncs.mutex_unlock(&currentThreadStateListMutex);
 
-    free(apiState);
+    free(threadState);
 }
 
 /*
@@ -568,116 +633,91 @@ static void DestroyAPIState(__GLXAPIState *apiState)
  * by glXDestroyContext(), and removes any context -> screen mappings if
  * necessary.
  */
-void __glXNotifyContextDestroyed(GLXContext ctx)
+void __glXRemoveVendorContextMapping(Display *dpy, GLXContext context)
 {
-    Bool canUnmap = True;
-    __GLXcurrentContextHash *pEntry = NULL;
-    __glXPthreadFuncs.mutex_lock(&currentContextHashLock);
+    __GLXcontextInfo *ctxInfo;
+    __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
 
-    HASH_FIND(hh, currentContextHash, &ctx, sizeof(ctx), pEntry);
-
-    if (pEntry) {
-        canUnmap = False;
-        pEntry->needsUnmap = True;
+    HASH_FIND_PTR(glxContextHash, &context, ctxInfo);
+    if (ctxInfo != NULL) {
+        ctxInfo->deleted = True;
+        CheckContextDeleted(ctxInfo);
     }
-
-    if (canUnmap) {
-        /*
-         * Note: this implies a lock ordering: the current context
-         * hash lock must be taken before the screen pointer hash lock!
-         */
-        __glXRemoveVendorContextMapping(NULL, ctx);
-    }
-
-    __glXPthreadFuncs.mutex_unlock(&currentContextHashLock);
-
+    __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
 }
 
-/*!
- * Updates the current context.
- *
- * If both newCtx and oldCtx are not NULL, then it will replace the old context
- * with the new context in the currentContextHash table.
- *
- * This function will remove the old context from the currentContextHash
- * hashtable, and add the new context to it.
- *
- * If the old context was flagged for deletion, then it will also remove the
- * context from the (context, screen) mapping.
- *
- * \note that the only case where this function can fail is if \p oldCtx is NULL
- * and \p newCtx is not NULL, because it has to allocate a new hashtable entry.
- *
- * \note currentContextHashLock must be locked before calling this
- * function.
- *
- * \param[in] newCtx The new context to make current, or \c NULL to just
- * release the current context.
- * \param[in] oldCtx The previous current context, or \c NULL if no context was
- * current before.
- *
- * \return True on success, False otherwise.
- */
-static Bool UpdateCurrentContext(GLXContext newCtx,
-                                 GLXContext oldCtx)
+int __glXAddVendorContextMapping(Display *dpy, GLXContext context, __GLXvendorInfo *vendor)
 {
-    __GLXcurrentContextHash *pEntry;
+    __GLXcontextInfo *ctxInfo;
 
-    if (oldCtx != NULL) {
-        Bool needsUnmap;
+    __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
 
-        HASH_FIND(hh, currentContextHash, &oldCtx, sizeof(oldCtx), pEntry);
-        assert(pEntry);
-
-        HASH_DELETE(hh, currentContextHash, pEntry);
-        needsUnmap = pEntry->needsUnmap;
-
-        if (newCtx != NULL)
-        {
-            // Switching to a new context. Reuse the same structure so that we
-            // don't have to worry about malloc failing.
-            pEntry->ctx = newCtx;
-            pEntry->needsUnmap = False;
-            HASH_ADD(hh, currentContextHash, ctx, sizeof(newCtx), pEntry);
+    HASH_FIND_PTR(glxContextHash, &context, ctxInfo);
+    if (ctxInfo == NULL) {
+        ctxInfo = (__GLXcontextInfo *) malloc(sizeof(__GLXcontextInfo));
+        if (ctxInfo == NULL) {
+            __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
+            return -1;
         }
-        else
-        {
-            // We're releasing the current context, so free the structure.
-            free(pEntry);
-        }
-
-        if (needsUnmap) {
-            __glXRemoveVendorContextMapping(NULL, oldCtx);
-        }
+        ctxInfo->context = context;
+        ctxInfo->vendor = vendor;
+        ctxInfo->currentCount = 0;
+        ctxInfo->deleted = False;
+        HASH_ADD_PTR(glxContextHash, context, ctxInfo);
     } else {
-        // We're adding a current context but we didn't have one before, so
-        // allocate a new hash entry.
-        assert(newCtx != NULL);
-
-        pEntry = malloc(sizeof(*pEntry));
-        if (!pEntry) {
-            return False;
+        if (ctxInfo->vendor != vendor) {
+            __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
+            return -1;
         }
-        pEntry->ctx = newCtx;
-        pEntry->needsUnmap = False;
-        HASH_ADD(hh, currentContextHash, ctx, sizeof(newCtx), pEntry);
     }
 
-    return True;
+    __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
+    return 0;
 }
 
-/*
- * Note: __glXCurrentContextHash must be (read or write)-locked before calling
- * this function!
- */
-static Bool IsContextCurrentToAnyOtherThread(GLXContext ctx)
+__GLXvendorInfo *__glXVendorFromContext(GLXContext context)
 {
-    GLXContext current = glXGetCurrentContext();
-    __GLXcurrentContextHash *pEntry = NULL;
+    __GLXcontextInfo *ctxInfo;
+    __GLXvendorInfo *vendor = NULL;
 
-    HASH_FIND(hh, currentContextHash, &ctx, sizeof(ctx), pEntry);
+    __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
+    HASH_FIND_PTR(glxContextHash, &context, ctxInfo);
+    if (ctxInfo != NULL) {
+        vendor = ctxInfo->vendor;
+    }
+    __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
 
-    return !!pEntry && (current != ctx);
+    return vendor;
+}
+
+static void FreeContextInfo(__GLXcontextInfo *ctx)
+{
+    if (ctx != NULL) {
+        HASH_DELETE(hh, glxContextHash, ctx);
+        free(ctx);
+    }
+}
+
+static void UpdateCurrentContext(__GLXcontextInfo *newCtxInfo, __GLXcontextInfo *oldCtxInfo)
+{
+    if (newCtxInfo == oldCtxInfo) {
+        return;
+    }
+    if (newCtxInfo != NULL) {
+        newCtxInfo->currentCount++;
+    }
+    if (oldCtxInfo != NULL) {
+        assert(oldCtxInfo->currentCount > 0);
+        oldCtxInfo->currentCount--;
+        CheckContextDeleted(oldCtxInfo);
+    }
+}
+
+static void CheckContextDeleted(__GLXcontextInfo *ctx)
+{
+    if (ctx->deleted && ctx->currentCount == 0) {
+        FreeContextInfo(ctx);
+    }
 }
 
 static void __glXSendError(Display *dpy, unsigned char errorCode,
@@ -729,14 +769,14 @@ static void NotifyXError(Display *dpy, unsigned char errorCode,
 
 static Bool InternalLoseCurrent(void)
 {
-    __GLXAPIState *apiState = __glXGetCurrentAPIState();
+    __GLXThreadState *threadState = __glXGetCurrentThreadState();
     Bool ret;
 
-    if (apiState == NULL) {
+    if (threadState == NULL) {
         return True;
     }
 
-    ret = apiState->currentVendor->staticDispatch.makeCurrent(apiState->currentDisplay, None, NULL);
+    ret = threadState->currentVendor->staticDispatch.makeCurrent(threadState->currentDisplay, None, NULL);
     if (!ret) {
         return False;
     }
@@ -744,49 +784,49 @@ static Bool InternalLoseCurrent(void)
     __glDispatchLoseCurrent();
 
     // Remove the context from the current context map.
-    UpdateCurrentContext(NULL, apiState->currentContext);
-    DestroyAPIState(apiState);
+    UpdateCurrentContext(NULL, threadState->currentContext);
+    DestroyThreadState(threadState);
 
     return True;
 }
 
 /**
  * Calls into the vendor library to set the current context, and then updates
- * the API state fields to match.
+ * the thread state fields to match.
  *
  * This function does *not* call into libGLdispatch, so it can only switch
  * to another context with the same vendor.
  *
  * If this function succeeds, then it will update the current display, context,
- * and drawables in \p apiState.
+ * and drawables in \p threadState.
  *
- * If it fails, then it will leave \p apiState unmodified. It's up to the
+ * If it fails, then it will leave \p threadState unmodified. It's up to the
  * vendor library to ensure that the old context is still current in that case.
  */
 static Bool InternalMakeCurrentVendor(
         Display *dpy, GLXDrawable draw, GLXDrawable read,
-        GLXContext context, char callerOpcode,
-        __GLXAPIState *apiState,
+        __GLXcontextInfo *ctxInfo, char callerOpcode,
+        __GLXThreadState *threadState,
         __GLXvendorInfo *vendor)
 {
     Bool ret;
 
-    assert(apiState->currentVendor == vendor);
+    assert(threadState->currentVendor == vendor);
 
     if (callerOpcode == X_GLXMakeCurrent && draw == read) {
-        ret = vendor->staticDispatch.makeCurrent(dpy, draw, context);
+        ret = vendor->staticDispatch.makeCurrent(dpy, draw, ctxInfo->context);
     } else {
         ret = vendor->staticDispatch.makeContextCurrent(dpy,
                                                     draw,
                                                     read,
-                                                    context);
+                                                    ctxInfo->context);
     }
 
     if (ret) {
-        apiState->currentDisplay = dpy;
-        apiState->currentDraw = draw;
-        apiState->currentRead = read;
-        apiState->currentContext = context;
+        threadState->currentDisplay = dpy;
+        threadState->currentDraw = draw;
+        threadState->currentRead = read;
+        threadState->currentContext = ctxInfo;
     }
 
     return ret;
@@ -796,51 +836,49 @@ static Bool InternalMakeCurrentVendor(
  * Makes a context current. This function handles both the vendor library and
  * libGLdispatch.
  *
- * There must not be a current API state in libGLdispatch when this function is
- * called.
+ * There must not be a current thread state in libGLdispatch when this function
+ * is called.
  *
  * If this function fails, then it will release the context and dispatch state
  * before returning.
  */
 static Bool InternalMakeCurrentDispatch(
         Display *dpy, GLXDrawable draw, GLXDrawable read,
-        GLXContext context, char callerOpcode,
+        __GLXcontextInfo *ctxInfo, char callerOpcode,
         __GLXvendorInfo *vendor)
 {
-    __GLXAPIState *apiState;
+    __GLXThreadState *threadState;
     Bool ret;
 
-    assert(__glXGetCurrentAPIState() == NULL);
+    assert(__glXGetCurrentThreadState() == NULL);
 
-    if (!UpdateCurrentContext(context, NULL)) {
-        return False;
-    }
+    UpdateCurrentContext(ctxInfo, NULL);
 
-    apiState = CreateAPIState(vendor);
-    if (apiState == NULL) {
-        UpdateCurrentContext(NULL, context);
+    threadState = CreateThreadState(vendor);
+    if (threadState == NULL) {
+        UpdateCurrentContext(NULL, ctxInfo);
         return False;
     }
 
     ret = __glDispatchMakeCurrent(
-        &apiState->glas,
+        &threadState->glas,
         vendor->glDispatch,
         vendor->vendorID,
-        vendor->glxvc->patchCallbacks
+        vendor->patchCallbacks
     );
 
     if (ret) {
         // Call into the vendor library.
-        ret = InternalMakeCurrentVendor(dpy, draw, read, context, callerOpcode,
-                apiState, vendor);
+        ret = InternalMakeCurrentVendor(dpy, draw, read, ctxInfo, callerOpcode,
+                threadState, vendor);
         if (!ret) {
             __glDispatchLoseCurrent();
         }
     }
 
     if (!ret) {
-        DestroyAPIState(apiState);
-        UpdateCurrentContext(NULL, context);
+        DestroyThreadState(threadState);
+        UpdateCurrentContext(NULL, ctxInfo);
     }
 
     return ret;
@@ -853,37 +891,45 @@ static Bool CommonMakeCurrent(Display *dpy, GLXDrawable draw,
                                   GLXDrawable read, GLXContext context,
                                   char callerOpcode)
 {
-    __GLXAPIState *apiState;
+    __GLXThreadState *threadState;
     __GLXvendorInfo *oldVendor, *newVendor;
     Display *oldDpy;
     GLXDrawable oldDraw, oldRead;
-    GLXContext oldContext;
+    __GLXcontextInfo *oldCtxInfo;
+    __GLXcontextInfo *newCtxInfo;
     Bool ret;
 
     __glXThreadInitialize();
-    apiState = __glXGetCurrentAPIState();
+    threadState = __glXGetCurrentThreadState();
 
-    if (apiState != NULL) {
-        oldVendor = apiState->currentVendor;
-        oldDpy = apiState->currentDisplay;
-        oldDraw = apiState->currentDraw;
-        oldRead = apiState->currentRead;
-        oldContext = apiState->currentContext;
+    if (threadState != NULL) {
+        oldVendor = threadState->currentVendor;
+        oldDpy = threadState->currentDisplay;
+        oldDraw = threadState->currentDraw;
+        oldRead = threadState->currentRead;
+        oldCtxInfo = threadState->currentContext;
 
-        assert(oldContext != NULL);
+        assert(oldCtxInfo != NULL);
 
-        if (dpy == oldDpy && context == oldContext
+        if (dpy == oldDpy && context == oldCtxInfo->context
                 && draw == oldDraw && read == oldRead) {
             // The current display, context, and drawables are the same, so just
             // return.
             return True;
         }
     } else {
+        // We might have a non-GLX context current...
+        __GLdispatchThreadState *glas = __glDispatchGetCurrentThreadState();
+        if (glas != NULL && glas->tag != GLDISPATCH_API_GLX) {
+            NotifyXError(dpy, BadAccess, 0, callerOpcode, True, NULL);
+            return False;
+        }
+
         // We don't have a current context already.
         oldVendor = NULL;
         oldDpy = NULL;
         oldDraw = oldRead = None;
-        oldContext = NULL;
+        oldCtxInfo = NULL;
     }
 
     /*
@@ -904,23 +950,19 @@ static Bool CommonMakeCurrent(Display *dpy, GLXDrawable draw,
         return False;
     }
 
-    if (oldContext == NULL && context == NULL) {
+    if (oldCtxInfo == NULL && context == NULL) {
         // If both the old and new contexts are NULL, then there's nothing to
         // do. Just return early.
         return True;
     }
 
-
-    __glXPthreadFuncs.mutex_lock(&currentContextHashLock);
+    __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
 
     if (context != NULL) {
-        if (IsContextCurrentToAnyOtherThread(context)) {
-            __glXPthreadFuncs.mutex_unlock(&currentContextHashLock);
-            NotifyXError(dpy, BadAccess, 0, callerOpcode, True, oldVendor);
-            return False;
-        }
+        HASH_FIND_PTR(glxContextHash, &context, newCtxInfo);
+        if (newCtxInfo == NULL) {
+            __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
 
-        if (__glXVendorFromContext(context, &newVendor) != 0) {
             /*
              * We can run into this corner case if a GLX client calls
              * glXDestroyContext() on a current context, loses current to this
@@ -928,17 +970,18 @@ static Bool CommonMakeCurrent(Display *dpy, GLXDrawable draw,
              * context again.  This is incorrect application behavior, but we should
              * attempt to handle this failure gracefully.
              */
-            __glXPthreadFuncs.mutex_unlock(&currentContextHashLock);
             NotifyXError(dpy, GLXBadContext, 0, callerOpcode, False, oldVendor);
             return False;
         }
+        newVendor = newCtxInfo->vendor;
         assert(newVendor != NULL);
     } else {
+        newCtxInfo = NULL;
         newVendor = NULL;
     }
 
     if (oldVendor == newVendor) {
-        assert(apiState != NULL);
+        assert(threadState != NULL);
 
         /*
          * We're switching between two contexts that use the same vendor. That
@@ -946,10 +989,10 @@ static Bool CommonMakeCurrent(Display *dpy, GLXDrawable draw,
          * that libGLdispatch cares about. Call into the vendor library to
          * switch contexts, but don't call into libGLdispatch.
          */
-        ret = InternalMakeCurrentVendor(dpy, draw, read, context, callerOpcode,
-                apiState, newVendor);
+        ret = InternalMakeCurrentVendor(dpy, draw, read, newCtxInfo, callerOpcode,
+                threadState, newVendor);
         if (ret) {
-            UpdateCurrentContext(context, oldContext);
+            UpdateCurrentContext(newCtxInfo, oldCtxInfo);
         }
     } else if (newVendor == NULL) {
         /*
@@ -963,7 +1006,7 @@ static Bool CommonMakeCurrent(Display *dpy, GLXDrawable draw,
          * We don't have a current context, so we only need to make the new one
          * current.
          */
-        ret = InternalMakeCurrentDispatch(dpy, draw, read, context, callerOpcode,
+        ret = InternalMakeCurrentDispatch(dpy, draw, read, newCtxInfo, callerOpcode,
                 newVendor);
     } else {
         /*
@@ -977,25 +1020,32 @@ static Bool CommonMakeCurrent(Display *dpy, GLXDrawable draw,
          * To do that, we'll first release the current context, and then make
          * the new context current.
          */
+
+        // First, check to see if calling InternalLoseCurrent is going to
+        // destroy the old context.
+        Bool canRestoreOldContext = True;
+        if (oldCtxInfo->deleted && oldCtxInfo->currentCount == 1) {
+            canRestoreOldContext = False;
+        }
         ret = InternalLoseCurrent();
 
         if (ret) {
-            ret = InternalMakeCurrentDispatch(dpy, draw, read, context, callerOpcode,
+            ret = InternalMakeCurrentDispatch(dpy, draw, read, newCtxInfo, callerOpcode,
                     newVendor);
-            if (!ret) {
+            if (!ret && canRestoreOldContext) {
                 /*
                  * Try to restore the old context. Note that this can fail if
                  * the old context was marked for deletion. If that happens,
                  * then we'll end up with no current context instead, but we
                  * should at least still be in a consistent state.
                  */
-                InternalMakeCurrentDispatch(oldDpy, oldDraw, oldRead, oldContext,
+                InternalMakeCurrentDispatch(oldDpy, oldDraw, oldRead, oldCtxInfo,
                         callerOpcode, oldVendor);
             }
         }
     }
 
-    __glXPthreadFuncs.mutex_unlock(&currentContextHashLock);
+    __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
     return ret;
 }
 
@@ -1327,7 +1377,7 @@ PUBLIC const char *glXGetClientString(Display *dpy, int name)
         return NULL;
     }
 
-    __glXPthreadFuncs.mutex_lock(&clientStringLock);
+    __glvndPthreadFuncs.mutex_lock(&clientStringLock);
 
     if (dpyInfo->clientStrings[index] != NULL) {
         goto done;
@@ -1365,7 +1415,7 @@ PUBLIC const char *glXGetClientString(Display *dpy, int name)
     }
 
 done:
-    __glXPthreadFuncs.mutex_unlock(&clientStringLock);
+    __glvndPthreadFuncs.mutex_unlock(&clientStringLock);
     if (vendorStrings != NULL) {
         free(vendorStrings);
     }
@@ -1391,7 +1441,6 @@ PUBLIC const char *glXQueryExtensionsString(Display *dpy, int screen)
     return pDispatch->queryExtensionsString(dpy, screen);
 }
 
-
 PUBLIC GLXFBConfig *glXChooseFBConfig(Display *dpy, int screen,
                                       const int *attrib_list, int *nelements)
 {
@@ -1406,8 +1455,17 @@ PUBLIC GLXFBConfig *glXChooseFBConfig(Display *dpy, int screen,
 
         if (fbconfigs != NULL) {
             int i;
+            Bool success = True;
             for (i = 0; i < *nelements; i++) {
-                __glXAddVendorFBConfigMapping(dpy, fbconfigs[i], vendor);
+                if (__glXAddVendorFBConfigMapping(dpy, fbconfigs[i], vendor) != 0) {
+                    success = False;
+                    break;
+                }
+            }
+            if (!success) {
+                XFree(fbconfigs);
+                fbconfigs = NULL;
+                *nelements = 0;
             }
         }
         return fbconfigs;
@@ -1424,7 +1482,10 @@ PUBLIC GLXPbuffer glXCreatePbuffer(Display *dpy, GLXFBConfig config,
     __GLXvendorInfo *vendor = CommonDispatchFBConfig(dpy, config, X_GLXCreatePbuffer);
     if (vendor != NULL) {
         pbuffer = vendor->staticDispatch.createPbuffer(dpy, config, attrib_list);
-        __glXAddVendorDrawableMapping(dpy, pbuffer, vendor);
+        if (__glXAddVendorDrawableMapping(dpy, pbuffer, vendor) != 0) {
+            vendor->staticDispatch.destroyPbuffer(dpy, pbuffer);
+            pbuffer = None;
+        }
     }
     return pbuffer;
 }
@@ -1437,7 +1498,10 @@ PUBLIC GLXPixmap glXCreatePixmap(Display *dpy, GLXFBConfig config,
     __GLXvendorInfo *vendor = CommonDispatchFBConfig(dpy, config, X_GLXCreatePixmap);
     if (vendor != NULL) {
         glxPixmap = vendor->staticDispatch.createPixmap(dpy, config, pixmap, attrib_list);
-        __glXAddVendorDrawableMapping(dpy, glxPixmap, vendor);
+        if (__glXAddVendorDrawableMapping(dpy, glxPixmap, vendor) != 0) {
+            vendor->staticDispatch.destroyGLXPixmap(dpy, glxPixmap);
+            glxPixmap = None;
+        }
     }
     return glxPixmap;
 }
@@ -1450,7 +1514,10 @@ PUBLIC GLXWindow glXCreateWindow(Display *dpy, GLXFBConfig config,
     __GLXvendorInfo *vendor = CommonDispatchFBConfig(dpy, config, X_GLXCreateWindow);
     if (vendor != NULL) {
         glxWindow = vendor->staticDispatch.createWindow(dpy, config, win, attrib_list);
-        __glXAddVendorDrawableMapping(dpy, glxWindow, vendor);
+        if (__glXAddVendorDrawableMapping(dpy, glxWindow, vendor) != 0) {
+            vendor->staticDispatch.destroyWindow(dpy, glxWindow);
+            glxWindow = None;
+        }
     }
     return glxWindow;
 }
@@ -1511,8 +1578,17 @@ PUBLIC GLXFBConfig *glXGetFBConfigs(Display *dpy, int screen, int *nelements)
         GLXFBConfig *fbconfigs = vendor->staticDispatch.getFBConfigs(dpy, screen, nelements);
         if (fbconfigs != NULL) {
             int i;
+            Bool success = True;
             for (i = 0; i < *nelements; i++) {
-                __glXAddVendorFBConfigMapping(dpy, fbconfigs[i], vendor);
+                if (__glXAddVendorFBConfigMapping(dpy, fbconfigs[i], vendor) != 0) {
+                    success = False;
+                    break;
+                }
+            }
+            if (!success) {
+                XFree(fbconfigs);
+                fbconfigs = NULL;
+                *nelements = 0;
             }
         }
         return fbconfigs;
@@ -1644,7 +1720,7 @@ void cacheInitializeOnce(void)
         LOCAL_FUNC_TABLE_ENTRY(glXFreeContextEXT)
     };
 
-    LKDHASH_WRLOCK(__glXPthreadFuncs, __glXProcAddressHash);
+    LKDHASH_WRLOCK(__glXProcAddressHash);
 
     // Initialize the hash table with our locally-exported functions
 
@@ -1660,7 +1736,7 @@ void cacheInitializeOnce(void)
         HASH_ADD_KEYPTR(hh, _LH(__glXProcAddressHash), pEntry->procName,
                         strlen((const char *)pEntry->procName), pEntry);
     }
-    LKDHASH_UNLOCK(__glXPthreadFuncs, __glXProcAddressHash);
+    LKDHASH_UNLOCK(__glXProcAddressHash);
 
 }
 
@@ -1682,12 +1758,12 @@ static __GLXextFuncPtr __glXGetCachedProcAddress(const GLubyte *procName)
     static glvnd_once_t cacheInitializeOnceControl = GLVND_ONCE_INIT;
     __GLXprocAddressHash *pEntry = NULL;
 
-    __glXPthreadFuncs.once(&cacheInitializeOnceControl, cacheInitializeOnce);
+    __glvndPthreadFuncs.once(&cacheInitializeOnceControl, cacheInitializeOnce);
 
-    LKDHASH_RDLOCK(__glXPthreadFuncs, __glXProcAddressHash);
+    LKDHASH_RDLOCK(__glXProcAddressHash);
     HASH_FIND(hh, _LH(__glXProcAddressHash), procName,
               strlen((const char *)procName), pEntry);
-    LKDHASH_UNLOCK(__glXPthreadFuncs, __glXProcAddressHash);
+    LKDHASH_UNLOCK(__glXProcAddressHash);
 
     if (pEntry) {
         return pEntry->addr;
@@ -1702,7 +1778,7 @@ PUBLIC __GLXextFuncPtr __glXGLLoadGLXFunction(const char *name,
     __GLXextFuncPtr func;
 
     if (mutex != NULL) {
-        __glXPthreadFuncs.mutex_lock(mutex);
+        __glvndPthreadFuncs.mutex_lock(mutex);
     }
 
     func = *ptr;
@@ -1712,7 +1788,7 @@ PUBLIC __GLXextFuncPtr __glXGLLoadGLXFunction(const char *name,
     }
 
     if (mutex != NULL) {
-        __glXPthreadFuncs.mutex_unlock(mutex);
+        __glvndPthreadFuncs.mutex_unlock(mutex);
     }
     return func;
 }
@@ -1737,11 +1813,11 @@ static void cacheProcAddress(const GLubyte *procName, __GLXextFuncPtr addr)
 
     pEntry->addr = addr;
 
-    LKDHASH_WRLOCK(__glXPthreadFuncs, __glXProcAddressHash);
+    LKDHASH_WRLOCK(__glXProcAddressHash);
     HASH_ADD_KEYPTR(hh, _LH(__glXProcAddressHash), pEntry->procName,
                     strlen((const char*)pEntry->procName),
                     pEntry);
-    LKDHASH_UNLOCK(__glXPthreadFuncs, __glXProcAddressHash);
+    LKDHASH_UNLOCK(__glXProcAddressHash);
 }
 
 PUBLIC __GLXextFuncPtr glXGetProcAddressARB(const GLubyte *procName)
@@ -1902,33 +1978,22 @@ void __glXThreadInitialize(void)
     __glDispatchCheckMultithreaded();
 }
 
-void CurrentContextHashCleanup(void *unused, __GLXcurrentContextHash *pEntry)
-{
-    if (pEntry->needsUnmap) {
-        __glXRemoveVendorContextMapping(NULL, pEntry->ctx);
-    }
-}
-
 static void __glXAPITeardown(Bool doReset)
 {
-    __GLXAPIState *apiState, *apiStateTemp;
-    __GLXcurrentContextHash *currContext, *currContextTemp;
+    __GLXThreadState *threadState, *threadStateTemp;
+    __GLXcontextInfo *currContext, *currContextTemp;
 
-    /*
-     * XXX: This will leave dangling screen-context mappings, but they will be
-     * cleared separately in __glXMappingTeardown().
-     */
-    __glXPthreadFuncs.mutex_lock(&currentContextHashLock);
-    HASH_ITER(hh, currentContextHash, currContext, currContextTemp) {
-        HASH_DEL(currentContextHash, currContext);
-        free(currContext);
+    __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
+    HASH_ITER(hh, glxContextHash, currContext, currContextTemp) {
+        FreeContextInfo(currContext);
     }
-    assert(currentContextHash == NULL);
-    __glXPthreadFuncs.mutex_unlock(&currentContextHashLock);
 
-    glvnd_list_for_each_entry_safe(apiState, apiStateTemp, &currentAPIStateList, entry) {
-        glvnd_list_del(&apiState->entry);
-        free(apiState);
+    assert(glxContextHash == NULL);
+    __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
+
+    glvnd_list_for_each_entry_safe(threadState, threadStateTemp, &currentThreadStateList, entry) {
+        glvnd_list_del(&threadState->entry);
+        free(threadState);
     }
 
     if (doReset) {
@@ -1936,10 +2001,10 @@ static void __glXAPITeardown(Bool doReset)
          * XXX: We should be able to get away with just resetting the proc address
          * hash lock, and not throwing away cached addresses.
          */
-        __glXPthreadFuncs.rwlock_init(&__glXProcAddressHash.lock, NULL);
-        __glXPthreadFuncs.mutex_init(&currentAPIStateListMutex, NULL);
+        __glvndPthreadFuncs.rwlock_init(&__glXProcAddressHash.lock, NULL);
+        __glvndPthreadFuncs.mutex_init(&currentThreadStateListMutex, NULL);
     } else {
-        LKDHASH_TEARDOWN(__glXPthreadFuncs, __GLXprocAddressHash,
+        LKDHASH_TEARDOWN(__GLXprocAddressHash,
                          __glXProcAddressHash, CleanupProcAddressEntry,
                          NULL, False);
     }
@@ -1972,22 +2037,22 @@ void _init(void)
 
     /* Initialize GLdispatch; this will also initialize our pthreads imports */
     __glDispatchInit();
-    glvndSetupPthreads(RTLD_DEFAULT, &__glXPthreadFuncs);
+    glvndSetupPthreads();
 
-    glvnd_list_init(&currentAPIStateList);
+    glvnd_list_init(&currentThreadStateList);
 
     /*
-     * currentContextHashLock must be a recursive mutex, because we'll have it
+     * glxContextHashLock must be a recursive mutex, because we'll have it
      * locked when we call into the vendor library's glXMakeCurrent
      * implementation. If the vendor library generates an X error, then that
      * will often result in a call to exit. In that case, the teardown code
      * will try to lock the mutex again so that it can clean up the current
      * context list.
      */
-    __glXPthreadFuncs.mutexattr_init(&mutexAttribs);
-    __glXPthreadFuncs.mutexattr_settype(&mutexAttribs, PTHREAD_MUTEX_RECURSIVE);
-    __glXPthreadFuncs.mutex_init(&currentContextHashLock, &mutexAttribs);
-    __glXPthreadFuncs.mutexattr_destroy(&mutexAttribs);
+    __glvndPthreadFuncs.mutexattr_init(&mutexAttribs);
+    __glvndPthreadFuncs.mutexattr_settype(&mutexAttribs, PTHREAD_MUTEX_RECURSIVE);
+    __glvndPthreadFuncs.mutex_init(&glxContextHashLock, &mutexAttribs);
+    __glvndPthreadFuncs.mutexattr_destroy(&mutexAttribs);
 
     {
         /*
@@ -2003,9 +2068,6 @@ void _init(void)
 
     /* TODO install fork handlers using __register_atfork */
 
-    /* Register our XCloseDisplay() callback */
-    XGLVRegisterCloseDisplayCallback(DisplayClosed);
-
     DBG_PRINTF(0, "Loading GLX...\n");
 
 }
@@ -2020,19 +2082,15 @@ void _fini(void)
     __glXThreadInitialize();
 
     /*
-     * If libGLX owns the current API state, lose current
+     * If libGLX owns the current thread state, lose current
      * in GLdispatch before going further.
      */
-    __GLdispatchAPIState *glas =
-        __glDispatchGetCurrentAPIState();
+    __GLdispatchThreadState *glas =
+        __glDispatchGetCurrentThreadState();
 
     if (glas && glas->tag == GLDISPATCH_API_GLX) {
         __glDispatchLoseCurrent();
     }
-
-
-    /* Unregister all XCloseDisplay() callbacks */
-    XGLVUnregisterCloseDisplayCallbacks();
 
     /* Tear down all GLX API state */
     __glXAPITeardown(False);
