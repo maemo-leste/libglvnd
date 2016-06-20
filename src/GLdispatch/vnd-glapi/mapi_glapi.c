@@ -27,7 +27,7 @@
  */
 
 #include <string.h>
-#include "glapi/glapi.h"
+#include "glapi.h"
 #include "u_current.h"
 #include "table.h" /* for MAPI_TABLE_NUM_SLOTS */
 #include "stub.h"
@@ -88,8 +88,8 @@ _glapi_get_stub(const char *name, int generate)
 {
    const struct mapi_stub *stub;
 
-    if (!name)
-        return NULL;
+   if (!name)
+      return NULL;
 
    stub = stub_find_public(name);
    if (!stub)

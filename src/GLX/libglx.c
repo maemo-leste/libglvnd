@@ -45,6 +45,7 @@
 #include "GL/glxproto.h"
 #include "libglxgl.h"
 #include "glvnd_list.h"
+#include "app_error_check.h"
 
 #include "lkdhash.h"
 
@@ -202,11 +203,12 @@ static __GLXvendorInfo *CommonDispatchFBConfig(Display *dpy, GLXFBConfig config,
 
 PUBLIC XVisualInfo* glXChooseVisual(Display *dpy, int screen, int *attrib_list)
 {
-    __glXThreadInitialize();
-
-    const __GLXdispatchTableStatic *pDispatch = __glXGetStaticDispatch(dpy, screen);
-
-    return pDispatch->chooseVisual(dpy, screen, attrib_list);
+    __GLXvendorInfo *vendor = __glXGetDynDispatch(dpy, screen);
+    if (vendor != NULL) {
+        return vendor->staticDispatch.chooseVisual(dpy, screen, attrib_list);
+    } else {
+        return NULL;
+    }
 }
 
 
@@ -230,11 +232,7 @@ PUBLIC void glXCopyContext(Display *dpy, GLXContext src, GLXContext dst,
 PUBLIC GLXContext glXCreateContext(Display *dpy, XVisualInfo *vis,
                             GLXContext share_list, Bool direct)
 {
-    __GLXvendorInfo *vendor;
-
-    __glXThreadInitialize();
-
-    vendor = __glXLookupVendorByScreen(dpy, vis->screen);
+    __GLXvendorInfo *vendor = __glXGetDynDispatch(dpy, vis->screen);
     if (vendor != NULL) {
         GLXContext context = vendor->staticDispatch.createContext(dpy, vis, share_list, direct);
         if (__glXAddVendorContextMapping(dpy, context, vendor) != 0) {
@@ -267,7 +265,17 @@ PUBLIC GLXContext glXCreateNewContext(Display *dpy, GLXFBConfig config,
 
 PUBLIC void glXDestroyContext(Display *dpy, GLXContext context)
 {
-    __GLXvendorInfo *vendor = CommonDispatchContext(dpy, context, X_GLXDestroyContext);
+    __GLXvendorInfo *vendor;
+
+    if (context == NULL) {
+        // Some drivers will just return without generating an error if the app
+        // passes NULL for a context, and unfortunately there are some broken
+        // applications that depend on that behavior.
+        glvndAppErrorCheckReportError("glXDestroyContext called with NULL for context\n");
+        return;
+    }
+
+    vendor = CommonDispatchContext(dpy, context, X_GLXDestroyContext);
     if (vendor != NULL) {
         __glXRemoveVendorContextMapping(dpy, context);
         vendor->staticDispatch.destroyContext(dpy, context);
@@ -441,11 +449,7 @@ static void glXFreeContextEXT(Display *dpy, GLXContext context)
 
 PUBLIC GLXPixmap glXCreateGLXPixmap(Display *dpy, XVisualInfo *vis, Pixmap pixmap)
 {
-    __GLXvendorInfo *vendor;
-
-    __glXThreadInitialize();
-
-    vendor = __glXLookupVendorByScreen(dpy, vis->screen);
+    __GLXvendorInfo *vendor = __glXGetDynDispatch(dpy, vis->screen);
     if (vendor != NULL) {
         GLXPixmap pmap = vendor->staticDispatch.createGLXPixmap(dpy, vis, pixmap);
         if (__glXAddVendorDrawableMapping(dpy, pmap, vendor) != 0) {
@@ -472,17 +476,20 @@ PUBLIC void glXDestroyGLXPixmap(Display *dpy, GLXPixmap pix)
 
 PUBLIC int glXGetConfig(Display *dpy, XVisualInfo *vis, int attrib, int *value)
 {
-    __glXThreadInitialize();
+    __GLXvendorInfo *vendor;
 
-    const __GLXdispatchTableStatic *pDispatch;
+    __glXThreadInitialize();
 
     if (!dpy || !vis || !value) {
         return GLX_BAD_VALUE;
     }
 
-    pDispatch = __glXGetStaticDispatch(dpy, vis->screen);
-
-    return pDispatch->getConfig(dpy, vis, attrib, value);
+    vendor = __glXLookupVendorByScreen(dpy, vis->screen);
+    if (vendor != NULL) {
+        return vendor->staticDispatch.getConfig(dpy, vis, attrib, value);
+    } else {
+        return GLX_BAD_VALUE;
+    }
 }
 
 PUBLIC GLXContext glXGetCurrentContext(void)
@@ -1150,31 +1157,28 @@ PUBLIC void glXSwapBuffers(Display *dpy, GLXDrawable drawable)
 
 PUBLIC void glXUseXFont(Font font, int first, int count, int list_base)
 {
-    __glXThreadInitialize();
-
-    const __GLXdispatchTableStatic *pDispatch = __glXGetCurrentDispatch();
-
-    pDispatch->useXFont(font, first, count, list_base);
+    __GLXvendorInfo *vendor = __glXGetCurrentDynDispatch();
+    if (vendor != NULL) {
+        vendor->staticDispatch.useXFont(font, first, count, list_base);
+    }
 }
 
 
 PUBLIC void glXWaitGL(void)
 {
-    __glXThreadInitialize();
-
-    const __GLXdispatchTableStatic *pDispatch = __glXGetCurrentDispatch();
-
-    pDispatch->waitGL();
+    __GLXvendorInfo *vendor = __glXGetCurrentDynDispatch();
+    if (vendor != NULL) {
+        vendor->staticDispatch.waitGL();
+    }
 }
 
 
 PUBLIC void glXWaitX(void)
 {
-    __glXThreadInitialize();
-
-    const __GLXdispatchTableStatic *pDispatch = __glXGetCurrentDispatch();
-
-    pDispatch->waitX();
+    __GLXvendorInfo *vendor = __glXGetCurrentDynDispatch();
+    if (vendor != NULL) {
+        vendor->staticDispatch.waitX();
+    }
 }
 
 /**
@@ -1197,8 +1201,13 @@ static const char **GetVendorClientStrings(Display *dpy, int name)
     }
 
     for (screen = 0; screen < num_screens; screen++) {
-        const __GLXdispatchTableStatic *pDispatch = __glXGetStaticDispatch(dpy, screen);
-        result[screen] = pDispatch->getClientString(dpy, name);
+        __GLXvendorInfo *vendor = __glXLookupVendorByScreen(dpy, screen);
+        if (vendor != NULL) {
+            result[screen] = vendor->staticDispatch.getClientString(dpy, name);
+        } else {
+            result[screen] = NULL;
+        }
+
         if (result[screen] == NULL) {
             free(result);
             return NULL;
@@ -1264,13 +1273,13 @@ static char *MergeExtensionStrings(char *currentString, const char *newString)
     name = newString;
     nameLen = 0;
     while (FindNextExtensionName(&name, &nameLen)) {
-        if (!IsExtensionInString(currentString, name, nameLen)) {
+        if (!IsExtensionInString(buf, name, nameLen)) {
             *ptr++ = ' ';
             memcpy(ptr, name, nameLen);
             ptr += nameLen;
+            *ptr = '\0';
         }
     }
-    *ptr = '\0';
     assert((size_t) (ptr - buf) == newLen);
     return buf;
 }
@@ -1363,9 +1372,12 @@ PUBLIC const char *glXGetClientString(Display *dpy, int name)
     if (num_screens == 1) {
         // There's only one screen, so we don't have to mess around with
         // merging the strings from multiple vendors.
-
-        const __GLXdispatchTableStatic *pDispatch = __glXGetStaticDispatch(dpy, 0);
-        return pDispatch->getClientString(dpy, name);
+        __GLXvendorInfo *vendor = __glXLookupVendorByScreen(dpy, 0);
+        if (vendor != NULL) {
+            return vendor->staticDispatch.getClientString(dpy, name);
+        } else {
+            return NULL;
+        }
     }
 
     if (name != GLX_VENDOR && name != GLX_VERSION && name != GLX_EXTENSIONS) {
@@ -1424,31 +1436,29 @@ done:
 
 PUBLIC const char *glXQueryServerString(Display *dpy, int screen, int name)
 {
-    __glXThreadInitialize();
-
-    const __GLXdispatchTableStatic *pDispatch = __glXGetStaticDispatch(dpy, screen);
-
-    return pDispatch->queryServerString(dpy, screen, name);
+    __GLXvendorInfo *vendor = __glXGetDynDispatch(dpy, screen);
+    if (vendor != NULL) {
+        return vendor->staticDispatch.queryServerString(dpy, screen, name);
+    } else {
+        return NULL;
+    }
 }
 
 
 PUBLIC const char *glXQueryExtensionsString(Display *dpy, int screen)
 {
-    __glXThreadInitialize();
-
-    const __GLXdispatchTableStatic *pDispatch = __glXGetStaticDispatch(dpy, screen);
-
-    return pDispatch->queryExtensionsString(dpy, screen);
+    __GLXvendorInfo *vendor = __glXGetDynDispatch(dpy, screen);
+    if (vendor != NULL) {
+        return vendor->staticDispatch.queryExtensionsString(dpy, screen);
+    } else {
+        return NULL;
+    }
 }
 
 PUBLIC GLXFBConfig *glXChooseFBConfig(Display *dpy, int screen,
                                       const int *attrib_list, int *nelements)
 {
-    __GLXvendorInfo *vendor;
-
-    __glXThreadInitialize();
-
-    vendor = __glXLookupVendorByScreen(dpy, screen);
+    __GLXvendorInfo *vendor = __glXGetDynDispatch(dpy, screen);
     if (vendor != NULL) {
         GLXFBConfig *fbconfigs =
             vendor->staticDispatch.chooseFBConfig(dpy, screen, attrib_list, nelements);
@@ -1569,11 +1579,7 @@ PUBLIC int glXGetFBConfigAttrib(Display *dpy, GLXFBConfig config,
 
 PUBLIC GLXFBConfig *glXGetFBConfigs(Display *dpy, int screen, int *nelements)
 {
-    __GLXvendorInfo *vendor;
-
-    __glXThreadInitialize();
-
-    vendor = __glXLookupVendorByScreen(dpy, screen);
+    __GLXvendorInfo *vendor = __glXGetDynDispatch(dpy, screen);
     if (vendor != NULL) {
         GLXFBConfig *fbconfigs = vendor->staticDispatch.getFBConfigs(dpy, screen, nelements);
         if (fbconfigs != NULL) {
@@ -1652,29 +1658,10 @@ PUBLIC void glXSelectEvent(Display *dpy, GLXDrawable draw, unsigned long event_m
     }
 }
 
-typedef struct {
-    GLubyte *procName;
-    __GLXextFuncPtr addr;
-    UT_hash_handle hh;
-} __GLXprocAddressHash;
-
-static DEFINE_INITIALIZED_LKDHASH(__GLXprocAddressHash, __glXProcAddressHash);
-
-#define LOCAL_FUNC_TABLE_ENTRY(func) \
-    { (GLubyte *)#func, (__GLXextFuncPtr)(func) },
-
-/*
- * This helper function initializes the __GLXprocAddressHash with the
- * dispatch functions implemented above.
- */
-void cacheInitializeOnce(void)
+const __GLXlocalDispatchFunction LOCAL_GLX_DISPATCH_FUNCTIONS[] =
 {
-    size_t i;
-    __GLXprocAddressHash *pEntry;
-    const struct {
-        const GLubyte *procName;
-        __GLXextFuncPtr addr;
-    } localFuncTable[] = {
+#define LOCAL_FUNC_TABLE_ENTRY(func) \
+    { #func, (__GLXextFuncPtr)(func) },
         LOCAL_FUNC_TABLE_ENTRY(glXChooseFBConfig)
         LOCAL_FUNC_TABLE_ENTRY(glXChooseVisual)
         LOCAL_FUNC_TABLE_ENTRY(glXCopyContext)
@@ -1718,32 +1705,17 @@ void cacheInitializeOnce(void)
 
         LOCAL_FUNC_TABLE_ENTRY(glXImportContextEXT)
         LOCAL_FUNC_TABLE_ENTRY(glXFreeContextEXT)
-    };
+#undef LOCAL_FUNC_TABLE_ENTRY
+    { NULL, NULL }
+};
 
-    LKDHASH_WRLOCK(__glXProcAddressHash);
+typedef struct {
+    GLubyte *procName;
+    __GLXextFuncPtr addr;
+    UT_hash_handle hh;
+} __GLXprocAddressHash;
 
-    // Initialize the hash table with our locally-exported functions
-
-    for (i = 0; i < ARRAY_LEN(localFuncTable); i++) {
-        pEntry = malloc(sizeof(*pEntry));
-        if (!pEntry) {
-            assert(pEntry);
-            break;
-        }
-        pEntry->procName =
-            (GLubyte *)strdup((const char *)localFuncTable[i].procName);
-        pEntry->addr = localFuncTable[i].addr;
-        HASH_ADD_KEYPTR(hh, _LH(__glXProcAddressHash), pEntry->procName,
-                        strlen((const char *)pEntry->procName), pEntry);
-    }
-    LKDHASH_UNLOCK(__glXProcAddressHash);
-
-}
-
-static void CleanupProcAddressEntry(void *unused, __GLXprocAddressHash *pEntry)
-{
-    free(pEntry->procName);
-}
+static DEFINE_INITIALIZED_LKDHASH(__GLXprocAddressHash, __glXProcAddressHash);
 
 /*
  * This function is called externally by the libGL wrapper library to
@@ -1755,10 +1727,7 @@ static __GLXextFuncPtr __glXGetCachedProcAddress(const GLubyte *procName)
      * If this is the first time GetProcAddress has been called,
      * initialize the hash table with locally-exported functions.
      */
-    static glvnd_once_t cacheInitializeOnceControl = GLVND_ONCE_INIT;
     __GLXprocAddressHash *pEntry = NULL;
-
-    __glvndPthreadFuncs.once(&cacheInitializeOnceControl, cacheInitializeOnce);
 
     LKDHASH_RDLOCK(__glXProcAddressHash);
     HASH_FIND(hh, _LH(__glXProcAddressHash), procName,
@@ -1770,6 +1739,68 @@ static __GLXextFuncPtr __glXGetCachedProcAddress(const GLubyte *procName)
     }
 
     return NULL;
+}
+
+static void cacheProcAddress(const GLubyte *procName, __GLXextFuncPtr addr)
+{
+    size_t nameLen = strlen((const char *) procName);
+    __GLXprocAddressHash *pEntry;
+
+    LKDHASH_WRLOCK(__glXProcAddressHash);
+
+    HASH_FIND(hh, _LH(__glXProcAddressHash), procName,
+              nameLen, pEntry);
+    if (pEntry == NULL) {
+        pEntry = malloc(sizeof(*pEntry) + nameLen + 1);
+        if (pEntry != NULL) {
+            pEntry->procName = (GLubyte *) (pEntry + 1);
+            memcpy(pEntry->procName, procName, nameLen + 1);
+            pEntry->addr = addr;
+            HASH_ADD_KEYPTR(hh, _LH(__glXProcAddressHash), pEntry->procName,
+                            nameLen, pEntry);
+        }
+    } else {
+        assert(pEntry->addr == addr);
+    }
+    LKDHASH_UNLOCK(__glXProcAddressHash);
+}
+
+PUBLIC __GLXextFuncPtr glXGetProcAddressARB(const GLubyte *procName)
+{
+    __glXThreadInitialize();
+
+    return glXGetProcAddress(procName);
+}
+
+PUBLIC __GLXextFuncPtr glXGetProcAddress(const GLubyte *procName)
+{
+    __GLXextFuncPtr addr = NULL;
+
+    __glXThreadInitialize();
+
+    /*
+     * Easy case: First check if we already know this address from
+     * a previous GetProcAddress() call or by virtue of being a function
+     * exported by libGLX.
+     */
+    addr = __glXGetCachedProcAddress(procName);
+    if (addr) {
+        return addr;
+    }
+
+    if (procName[0] == 'g' && procName[1] == 'l' && procName[2] == 'X') {
+        // This looks like a GLX function, so try to find a GLX dispatch stub.
+        addr = __glXGetGLXDispatchAddress(procName);
+    } else {
+        addr = __glDispatchGetProcAddress((const char *) procName);
+    }
+
+    /* Store the resulting proc address. */
+    if (addr) {
+        cacheProcAddress(procName, addr);
+    }
+
+    return addr;
 }
 
 PUBLIC __GLXextFuncPtr __glXGLLoadGLXFunction(const char *name,
@@ -1791,77 +1822,6 @@ PUBLIC __GLXextFuncPtr __glXGLLoadGLXFunction(const char *name,
         __glvndPthreadFuncs.mutex_unlock(mutex);
     }
     return func;
-}
-
-
-static void cacheProcAddress(const GLubyte *procName, __GLXextFuncPtr addr)
-{
-    __GLXprocAddressHash *pEntry = malloc(sizeof(*pEntry));
-
-    if (!pEntry) {
-        assert(pEntry);
-        return;
-    }
-
-    pEntry->procName = (GLubyte *)strdup((const char *)procName);
-
-    if (pEntry->procName == NULL) {
-        assert(pEntry->procName);
-        free(pEntry);
-        return;
-    }
-
-    pEntry->addr = addr;
-
-    LKDHASH_WRLOCK(__glXProcAddressHash);
-    HASH_ADD_KEYPTR(hh, _LH(__glXProcAddressHash), pEntry->procName,
-                    strlen((const char*)pEntry->procName),
-                    pEntry);
-    LKDHASH_UNLOCK(__glXProcAddressHash);
-}
-
-PUBLIC __GLXextFuncPtr glXGetProcAddressARB(const GLubyte *procName)
-{
-    __glXThreadInitialize();
-
-    return glXGetProcAddress(procName);
-}
-
-PUBLIC __GLXextFuncPtr glXGetProcAddress(const GLubyte *procName)
-{
-    __glXThreadInitialize();
-
-    __GLXextFuncPtr addr = NULL;
-
-    /*
-     * Easy case: First check if we already know this address from
-     * a previous GetProcAddress() call or by virtue of being a function
-     * exported by libGLX.
-     */
-    addr = __glXGetCachedProcAddress(procName);
-    if (addr) {
-        return addr;
-    }
-
-    /*
-     * If that doesn't work, try requesting a dispatch function
-     * from one of the loaded vendor libraries.
-     */
-    addr = __glXGetGLXDispatchAddress(procName);
-    if (addr) {
-        goto done;
-    }
-
-    /* If that doesn't work, then try to generate a stub function. */
-    addr = __glXGenerateGLXEntrypoint(procName);
-
-    /* Store the resulting proc address. */
-done:
-    if (addr) {
-        cacheProcAddress(procName, addr);
-    }
-
-    return addr;
 }
 
 int AtomicIncrement(int volatile *val)
@@ -1937,12 +1897,11 @@ int AtomicDecrementClampAtZero(int volatile *val)
 
 static void __glXResetOnFork(void);
 
-/*
- * Perform checks that need to occur when entering any GLX entrypoint.
- * Currently, this only detects whether a fork occurred since the last
- * entrypoint was called, and performs recovery as needed.
+/*!
+ * Checks to see if a fork occurred since the last GLX entrypoint was called,
+ * and performs recovery if needed.
  */
-void __glXThreadInitialize(void)
+static void CheckFork(void)
 {
     volatile static int g_threadsInCheck = 0;
     volatile static int g_lastPid = -1;
@@ -1974,7 +1933,15 @@ void __glXThreadInitialize(void)
             sched_yield();
         }
     }
+}
 
+/*!
+ * Handles any common tasks that need to occur at the beginning of any GLX
+ * entrypoint.
+ */
+void __glXThreadInitialize(void)
+{
+    CheckFork();
     __glDispatchCheckMultithreaded();
 }
 
@@ -2005,8 +1972,7 @@ static void __glXAPITeardown(Bool doReset)
         __glvndPthreadFuncs.mutex_init(&currentThreadStateListMutex, NULL);
     } else {
         LKDHASH_TEARDOWN(__GLXprocAddressHash,
-                         __glXProcAddressHash, CleanupProcAddressEntry,
-                         NULL, False);
+                         __glXProcAddressHash, NULL, NULL, False);
     }
 }
 
@@ -2038,6 +2004,7 @@ void _init(void)
     /* Initialize GLdispatch; this will also initialize our pthreads imports */
     __glDispatchInit();
     glvndSetupPthreads();
+    glvndAppErrorCheckInit();
 
     glvnd_list_init(&currentThreadStateList);
 
@@ -2053,6 +2020,8 @@ void _init(void)
     __glvndPthreadFuncs.mutexattr_settype(&mutexAttribs, PTHREAD_MUTEX_RECURSIVE);
     __glvndPthreadFuncs.mutex_init(&glxContextHashLock, &mutexAttribs);
     __glvndPthreadFuncs.mutexattr_destroy(&mutexAttribs);
+
+    __glXMappingInit();
 
     {
         /*
@@ -2078,8 +2047,14 @@ void __attribute__ ((destructor)) __glXFini(void)
 void _fini(void)
 #endif
 {
+    /*
+     * Note that the dynamic linker may have already called the destructors for
+     * the vendor libraries. As a result, we can't do anything here that would
+     * try to call into any vendor library.
+     */
+
     /* Check for a fork before going further. */
-    __glXThreadInitialize();
+    CheckFork();
 
     /*
      * If libGLX owns the current thread state, lose current
