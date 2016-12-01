@@ -2,7 +2,7 @@ dnl configure.ac
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.63])
-AC_INIT([libglvnd], [0.1.0], [kbrenneman@nvidia.com])
+AC_INIT([libglvnd], [0.2.999], [kbrenneman@nvidia.com])
 AC_CONFIG_SRCDIR([config.h.in])
 AC_CONFIG_HEADERS([config.h])
 
@@ -70,6 +70,9 @@ if test "x$enable_asm" = xyes; then
     armv7l)
         asm_arch=armv7l
         ;;
+    aarch64)
+        asm_arch=aarch64
+        ;;
     esac
 
     case "$asm_arch" in
@@ -84,6 +87,10 @@ if test "x$enable_asm" = xyes; then
     armv7l)
         DEFINES="$DEFINES -DUSE_ARMV7_ASM"
         AC_MSG_RESULT([yes, armv7l])
+        ;;
+    aarch64)
+        DEFINES="$DEFINES -DUSE_AARCH64_ASM"
+        AC_MSG_RESULT([yes, aarch64])
         ;;
     *)
         AC_MSG_RESULT([no, platform not supported])
@@ -153,6 +160,11 @@ xarmv7l)
     gldispatch_entry_type=armv7_tsd
     gldispatch_use_tls=no
     ;;
+xaarch64)
+    # For aarch64, only the TSD stubs have been implemented yet.
+    gldispatch_entry_type=aarch64_tsd
+    gldispatch_use_tls=no
+    ;;
 *)
     # The C stubs will work with either TLS or TSD.
     gldispatch_entry_type=pure_c
@@ -170,6 +182,7 @@ AM_CONDITIONAL([GLDISPATCH_TYPE_X86_TSD], [test "x$gldispatch_entry_type" = "xx8
 AM_CONDITIONAL([GLDISPATCH_TYPE_X86_64_TLS], [test "x$gldispatch_entry_type" = "xx86_64_tls"])
 AM_CONDITIONAL([GLDISPATCH_TYPE_X86_64_TSD], [test "x$gldispatch_entry_type" = "xx86_64_tsd"])
 AM_CONDITIONAL([GLDISPATCH_TYPE_ARMV7_TSD], [test "x$gldispatch_entry_type" = "xarmv7_tsd"])
+AM_CONDITIONAL([GLDISPATCH_TYPE_AARCH64_TSD], [test "x$gldispatch_entry_type" = "xaarch64_tsd"])
 AM_CONDITIONAL([GLDISPATCH_TYPE_PURE_C], [test "x$gldispatch_entry_type" = "xpure_c"])
 
 
@@ -218,6 +231,23 @@ AS_IF([test "x$HAVE_SYNC_INTRINSICS" = "xyes"],
       [AC_DEFINE([HAVE_SYNC_INTRINSICS], 1,
       [Define to 1 if the compiler supports __sync intrinsic functions.])])
 
+AC_CHECK_FUNC(mincore, [AC_DEFINE([HAVE_MINCORE], [1],
+    [Define to 1 if mincore is available.])])
+
+AC_MSG_CHECKING([for RTLD_NOLOAD])
+AC_COMPILE_IFELSE([AC_LANG_SOURCE([
+#include <dlfcn.h>
+void foo(void)
+{
+    (void) RTLD_NOLOAD;
+}
+])],
+[HAVE_RTLD_NOLOAD=yes],[HAVE_RTLD_NOLOAD=no])
+AC_MSG_RESULT($HAVE_RTLD_NOLOAD)
+AS_IF([test "x$HAVE_RTLD_NOLOAD" = "xyes"],
+      [AC_DEFINE([HAVE_RTLD_NOLOAD], 1,
+      [Define to 1 if the compiler supports RTLD_NOLOAD.])])
+
 # See if the linker supports the --no-undefined flag.
 AX_CHECK_LINK_FLAG([-Xlinker --no-undefined],
       [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], ["-Xlinker --no-undefined"])],
@@ -235,9 +265,10 @@ AC_CONFIG_FILES([Makefile
                  src/GLESv1/Makefile
                  src/GLESv2/Makefile
                  src/GLX/Makefile
+                 src/EGL/Makefile
                  src/GLdispatch/Makefile
                  src/GLdispatch/vnd-glapi/Makefile
                  src/util/Makefile
                  tests/Makefile
-                 tests/GLX_dummy/Makefile])
+                 tests/dummy/Makefile])
 AC_OUTPUT

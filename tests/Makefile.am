@@ -26,17 +26,20 @@
 # MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
 
 SUBDIRS = \
-	GLX_dummy
+	dummy
 
-noinst_HEADERS = test_utils.h
+noinst_HEADERS = \
+	test_utils.h \
+	egl_test_utils.h
 
 TESTS_ENVIRONMENT = \
+	TOP_SRCDIR=$(top_srcdir) \
 	TOP_BUILDDIR=$(top_builddir) \
 	ABS_TOP_BUILDDIR=$(abs_top_builddir)
 
 TESTS = \
-	init_test_env.sh \
 	testglxgetprocaddress.sh \
+	testglxgetprocaddress_genentry.sh \
 	testglxmcbasic.sh \
 	testglxmcloop.sh \
 	testglxmcthreads.sh \
@@ -44,17 +47,19 @@ TESTS = \
 	testglxmcoldlink.sh \
 	testglxgetclientstr.sh \
 	testglxqueryversion.sh \
-	testglxnscrthreads.sh \
 	testpatchentrypoints.sh \
-	fini_test_env.sh
+	testpatchentrypoints_gldispatch.sh \
+	testegldisplay.sh \
+	testegldevice.sh \
+	testeglgetprocaddress.sh \
+	testeglmakecurrent.sh \
+	testeglerror.sh \
+	testegldebug.sh
 
-# TODO: These tests depend on the x11glvnd server extension, which isn't used
-# anymore. They need to be rewritten to use the GLX_EXT_libglvnd extension
-# instead.
-#TESTS += testx11glvndproto.sh
-#TESTS += testglxnscreens.sh
-
-EXTRA_DIST = $(TESTS)
+EXTRA_DIST = $(TESTS) \
+	glxenv.sh \
+	eglenv.sh \
+	json
 
 check_PROGRAMS = \
 	testglxgetprocaddress \
@@ -62,23 +67,14 @@ check_PROGRAMS = \
 	testglxmakecurrent_oldlink \
 	testglxgetclientstr \
 	testglxqueryversion \
-	testpatchentrypoints
-
-#check_PROGRAMS += testx11glvndproto
-#check_PROGRAMS += testglxnscreens
-#
-#testglxnscreens_SOURCES = \
-#	$(top_srcdir)/src/util/glvnd_pthread.c \
-#	testglxnscreens.c \
-#	test_utils.c
-#
-#testglxnscreens_CFLAGS = -I$(top_srcdir)/$(X11GLVND_DIR) $(AM_CFLAGS)
-#
-#testglxnscreens_LDADD = -lX11
-#testglxnscreens_LDADD += $(top_builddir)/src/GLX/libGLX.la
-#testglxnscreens_LDADD += $(top_builddir)/src/OpenGL/libOpenGL.la
-#testglxnscreens_LDADD += $(top_builddir)/src/util/libtrace.la
-#testglxnscreens_LDADD += -lX11 -ldl $(top_builddir)/$(X11GLVND_DIR)/libx11glvnd_client.la
+	testpatchentrypoints \
+	testpatchentrypoints_gldispatch \
+	testegldisplay \
+	testegldevice \
+	testeglgetprocaddress \
+	testeglmakecurrent \
+	testeglerror \
+	testegldebug
 
 # The *_oldlink variant tests that linking against legacy libGL.so works
 
@@ -96,9 +92,6 @@ testglxmakecurrent_oldlink_LDADD = -lX11 -ldl
 testglxmakecurrent_oldlink_LDADD += $(top_builddir)/src/GL/libGL.la
 testglxmakecurrent_oldlink_LDADD += $(top_builddir)/src/util/libglvnd_pthread.la
 testglxmakecurrent_oldlink_LDADD += $(top_builddir)/src/util/libtrace.la
-
-#testx11glvndproto_CFLAGS = -I$(top_srcdir)/$(X11GLVND_DIR)
-#testx11glvndproto_LDADD = -lX11 $(top_builddir)/$(X11GLVND_DIR)/libx11glvnd_client.la
 
 # Disable annoying "unused" errors
 AM_CFLAGS =                                  \
@@ -135,3 +128,45 @@ testpatchentrypoints_LDADD = -lX11 -ldl
 testpatchentrypoints_LDADD += $(top_builddir)/src/GLX/libGLX.la
 testpatchentrypoints_LDADD += $(top_builddir)/src/OpenGL/libOpenGL.la
 testpatchentrypoints_LDADD += $(top_builddir)/src/util/libtrace.la
+
+testpatchentrypoints_gldispatch_SOURCES = \
+	testpatchentrypoints_gldispatch.c
+testpatchentrypoints_gldispatch_CFLAGS = \
+	-I$(top_srcdir)/include \
+	-I$(top_srcdir)/src/GLdispatch
+testpatchentrypoints_gldispatch_LDADD = $(top_builddir)/src/GLdispatch/libGLdispatch.la
+testpatchentrypoints_gldispatch_LDADD += $(top_builddir)/src/OpenGL/libOpenGL.la
+testpatchentrypoints_gldispatch_LDADD += dummy/libpatchentrypoints.la
+testpatchentrypoints_gldispatch_LDADD += $(top_builddir)/src/util/libutils_misc.la
+
+testegldisplay_SOURCES = \
+	testegldisplay.c \
+	egl_test_utils.c
+testegldisplay_LDADD = $(top_builddir)/src/EGL/libEGL.la
+
+testegldevice_SOURCES = \
+	testegldevice.c \
+	egl_test_utils.c
+testegldevice_LDADD = $(top_builddir)/src/EGL/libEGL.la
+
+testeglgetprocaddress_SOURCES = \
+	testeglgetprocaddress.c \
+	egl_test_utils.c
+testeglgetprocaddress_LDADD = $(top_builddir)/src/EGL/libEGL.la
+
+testeglmakecurrent_SOURCES = \
+	testeglmakecurrent.c \
+	egl_test_utils.c
+testeglmakecurrent_LDADD = $(top_builddir)/src/EGL/libEGL.la
+testeglmakecurrent_LDADD += $(top_builddir)/src/OpenGL/libOpenGL.la
+
+testeglerror_SOURCES = \
+	testeglerror.c \
+	egl_test_utils.c
+testeglerror_LDADD = $(top_builddir)/src/EGL/libEGL.la
+testeglerror_LDADD += $(top_builddir)/src/OpenGL/libOpenGL.la
+
+testegldebug_SOURCES = \
+	testegldebug.c \
+	egl_test_utils.c
+testegldebug_LDADD = $(top_builddir)/src/EGL/libEGL.la

@@ -552,13 +552,14 @@ void UnregisterAllStubCallbacks(void)
  */
 static int PatchEntrypoints(
    const __GLdispatchPatchCallbacks *patchCb,
-   int vendorID
+   int vendorID,
+   GLboolean force
 )
 {
     __GLdispatchStubCallback *stub;
     CheckDispatchLocked();
 
-    if (!PatchingIsSafe()) {
+    if (!force && !PatchingIsSafe()) {
         return 0;
     }
 
@@ -569,8 +570,10 @@ static int PatchEntrypoints(
 
     if (stubCurrentPatchCb) {
         // Notify the previous vendor that it no longer owns these
-        // entrypoints.
-        if (stubCurrentPatchCb->releasePatch != NULL) {
+        // entrypoints. If this is being called from a library unload,
+        // though, then skip the callback, because the vendor may have
+        // already been unloaded.
+        if (stubCurrentPatchCb->releasePatch != NULL && !force) {
             stubCurrentPatchCb->releasePatch();
         }
 
@@ -648,7 +651,7 @@ PUBLIC GLboolean __glDispatchMakeCurrent(__GLdispatchThreadState *threadState,
     LockDispatch();
 
     // Patch if necessary
-    PatchEntrypoints(patchCb, vendorID);
+    PatchEntrypoints(patchCb, vendorID, GL_FALSE);
 
     // If the current entrypoints are unsafe to use with this vendor, bail out.
     if (!CurrentEntrypointsSafeToUse(vendorID)) {
@@ -728,6 +731,30 @@ PUBLIC void __glDispatchLoseCurrent(void)
     LoseCurrentInternal(curThreadState, GL_FALSE);
 }
 
+PUBLIC GLboolean __glDispatchForceUnpatch(int vendorID)
+{
+    GLboolean ret = GL_FALSE;
+
+    LockDispatch();
+    if (stubCurrentPatchCb != NULL && stubOwnerVendorID == vendorID) {
+        /*
+         * The vendor library with the patch callbacks is about to be unloaded,
+         * so we need to unpatch the entrypoints even if there's a current
+         * context on another thread.
+         *
+         * If a buggy application is trying to call an OpenGL function on
+         * another thread, then we're going to run into problems, but in that
+         * case, it's just as likely that the other thread would be somewhere
+         * in the vendor library itself.
+         */
+        PatchEntrypoints(NULL, 0, GL_TRUE);
+        ret = GL_TRUE;
+    }
+    UnlockDispatch();
+
+    return ret;
+}
+
 __GLdispatchThreadState *__glDispatchGetCurrentThreadState(void)
 {
     return (__GLdispatchThreadState *) __glvndPthreadFuncs.getspecific(threadContextKey);
@@ -785,12 +812,6 @@ void __glDispatchFini(void)
 
         /* This frees the dispatchStubList */
         UnregisterAllStubCallbacks();
-
-        /* 
-         * Before we get here, client libraries should
-         * have cleared out the current dispatch list.
-         */
-        assert(glvnd_list_is_empty(&currentDispatchList));
 
         /*
          * Clear out the getProcAddress lists.

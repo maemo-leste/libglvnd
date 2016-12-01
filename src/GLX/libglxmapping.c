@@ -40,7 +40,6 @@
 #include "libglxcurrent.h"
 #include "libglxmapping.h"
 #include "libglxthread.h"
-#include "libglxstring.h"
 #include "libglxproto.h"
 #include "utils_misc.h"
 #include "glvnd_genentry.h"
@@ -547,10 +546,18 @@ __GLXvendorInfo *__glXLookupVendorByScreen(Display *dpy, const int screen)
          * If we have specified a vendor library, use that. Otherwise,
          * try to lookup the vendor based on the current screen.
          */
-        const char *preloadedVendorName = getenv("__GLX_VENDOR_LIBRARY_NAME");
+        char envName[40];
+        const char *specifiedVendorName;
 
-        if (preloadedVendorName) {
-            vendor = __glXLookupVendorByName(preloadedVendorName);
+        snprintf(envName, sizeof(envName), "__GLX_FORCE_VENDOR_LIBRARY_%d", screen);
+        specifiedVendorName = getenv(envName);
+
+        if (specifiedVendorName == NULL) {
+            specifiedVendorName = getenv("__GLX_VENDOR_LIBRARY_NAME");
+        }
+
+        if (specifiedVendorName) {
+            vendor = __glXLookupVendorByName(specifiedVendorName);
         }
 
         if (!vendor) {
@@ -644,8 +651,8 @@ static __GLXdisplayInfoHash *InitDisplayInfoEntry(Display *dpy)
                 screen++) {
             char *extensions = __glXQueryServerString(&pEntry->info, screen, GLX_EXTENSIONS);
             if (extensions != NULL) {
-                if (!IsExtensionInString(extensions, GLX_EXT_LIBGLVND_NAME,
-                            strlen(GLX_EXT_LIBGLVND_NAME))) {
+                if (!IsTokenInString(extensions, GLX_EXT_LIBGLVND_NAME,
+                            strlen(GLX_EXT_LIBGLVND_NAME), " ")) {
                     pEntry->info.libglvndExtensionSupported = False;
                 }
                 free(extensions);
@@ -1027,8 +1034,18 @@ void __glXMappingTeardown(Bool doReset)
             __glvndPthreadFuncs.rwlock_init(&dpyInfoEntry->info.vendorLock, NULL);
         }
     } else {
+        __GLXvendorNameHash *pEntry, *tmp;
+
         /* Tear down all hashtables used in this file */
         __glvndWinsysDispatchCleanup();
+
+        // If a GLX vendor library has patched the OpenGL entrypoints, then
+        // unpatch them before we unload the vendors.
+        LKDHASH_RDLOCK(__glXVendorNameHash);
+        HASH_ITER(hh, _LH(__glXVendorNameHash), pEntry, tmp) {
+            __glDispatchForceUnpatch(pEntry->vendor.vendorID);
+        }
+        LKDHASH_UNLOCK(__glXVendorNameHash);
 
         LKDHASH_TEARDOWN(__GLXvendorConfigMappingHash,
                          fbconfigHashtable, NULL, NULL, False);

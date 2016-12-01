@@ -39,7 +39,6 @@
 #include "libglxabipriv.h"
 #include "libglxmapping.h"
 #include "libglxcurrent.h"
-#include "libglxstring.h"
 #include "utils_misc.h"
 #include "trace.h"
 #include "GL/glxproto.h"
@@ -966,6 +965,13 @@ static Bool CommonMakeCurrent(Display *dpy, GLXDrawable draw,
     __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
 
     if (context != NULL) {
+        // Look up the new display. This will ensure that we keep track of it
+        // and get a callback when it's closed.
+        if (__glXLookupDisplay(dpy) == NULL) {
+            __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
+            return False;
+        }
+
         HASH_FIND_PTR(glxContextHash, &context, newCtxInfo);
         if (newCtxInfo == NULL) {
             __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
@@ -1216,72 +1222,41 @@ static const char **GetVendorClientStrings(Display *dpy, int name)
     return result;
 }
 
-/**
- * Merges two GLX_EXTENSIONS strings.
+/*!
+ * Parses the version string that you'd get from calling glXGetClientString
+ * with GLX_VERSION.
  *
- * If \p newString is a subset of \c currentString, then \c currentString will
- * be returned unmodified. Otherwise, \c currentString will be re-allocated
- * with enough space to hold the union of both string.
- *
- * If an error occurrs, then \c currentString will be freed before returning.
- *
- * \param currentString The current string, which must have been allocated with malloc.
- * \param newString The extension string to add.
- * \return A new extension string.
+ * \param version The version string.
+ * \param[out] major The major version number.
+ * \param[out] minor The minor version number.
+ * \param[out] vendor Returns a pointer to the vendor-specific part of the
+ * string, or \c NULL if it there isn't any vendor-specific string.
+ * \return Zero on success, or -1 if \c version doesn't match the correct
+ * format.
  */
-static char *MergeExtensionStrings(char *currentString, const char *newString)
+static int ParseClientVersionString(const char *version,
+        int *major, int *minor, const char **vendor)
 {
-    size_t origLen;
-    size_t newLen;
-    const char *name;
-    size_t nameLen;
-    char *buf, *ptr;
+    int count;
+    const char *ptr;
 
-    // Calculate the length of the new string.
-    origLen = newLen = strlen(currentString);
-
-    // The code below assumes that currentString is not empty, so if it is
-    // empty, then just copy the new string.
-    if (origLen == 0) {
-        buf = currentString;
-        if (newString[0] != '\0') {
-            buf = strdup(newString);
-            free(currentString);
-        }
-        return buf;
+    count = sscanf(version, "%d.%d", major, minor);
+    if (count != 2) {
+        return -1;
     }
 
-    name = newString;
-    nameLen = 0;
-    while (FindNextExtensionName(&name, &nameLen)) {
-        if (!IsExtensionInString(currentString, name, nameLen)) {
-            newLen += nameLen + 1;
+    // The vendor-specific info should be after the first space character.
+    *vendor = NULL;
+    ptr = strchr(version, ' ');
+    if (ptr != NULL) {
+        while (*ptr == ' ') {
+            ptr++;
+        }
+        if (*ptr != '\0') {
+            *vendor = ptr;
         }
     }
-    if (origLen == newLen) {
-        // No new extensions to add.
-        return currentString;
-    }
-
-    buf = (char *) realloc(currentString, newLen + 1);
-    if (buf == NULL) {
-        free(currentString);
-        return NULL;
-    }
-
-    ptr = buf + origLen;
-    name = newString;
-    nameLen = 0;
-    while (FindNextExtensionName(&name, &nameLen)) {
-        if (!IsExtensionInString(buf, name, nameLen)) {
-            *ptr++ = ' ';
-            memcpy(ptr, name, nameLen);
-            ptr += nameLen;
-            *ptr = '\0';
-        }
-    }
-    assert((size_t) (ptr - buf) == newLen);
-    return buf;
+    return 0;
 }
 
 /**
@@ -1415,7 +1390,7 @@ PUBLIC const char *glXGetClientString(Display *dpy, int name)
         } else if (name == GLX_VERSION) {
             dpyInfo->clientStrings[index] = MergeVersionStrings(dpyInfo->clientStrings[index], vendorStrings[screen]);
         } else if (name == GLX_EXTENSIONS) {
-            dpyInfo->clientStrings[index] = MergeExtensionStrings(dpyInfo->clientStrings[index], vendorStrings[screen]);
+            dpyInfo->clientStrings[index] = UnionExtensionStrings(dpyInfo->clientStrings[index], vendorStrings[screen]);
         } else {
             assert(!"Can't happen: Invalid string name");
             free(dpyInfo->clientStrings[index]);
@@ -1950,14 +1925,6 @@ static void __glXAPITeardown(Bool doReset)
     __GLXThreadState *threadState, *threadStateTemp;
     __GLXcontextInfo *currContext, *currContextTemp;
 
-    __glvndPthreadFuncs.mutex_lock(&glxContextHashLock);
-    HASH_ITER(hh, glxContextHash, currContext, currContextTemp) {
-        FreeContextInfo(currContext);
-    }
-
-    assert(glxContextHash == NULL);
-    __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
-
     glvnd_list_for_each_entry_safe(threadState, threadStateTemp, &currentThreadStateList, entry) {
         glvnd_list_del(&threadState->entry);
         free(threadState);
@@ -1970,9 +1937,29 @@ static void __glXAPITeardown(Bool doReset)
          */
         __glvndPthreadFuncs.rwlock_init(&__glXProcAddressHash.lock, NULL);
         __glvndPthreadFuncs.mutex_init(&currentThreadStateListMutex, NULL);
+
+        HASH_ITER(hh, glxContextHash, currContext, currContextTemp) {
+            currContext->currentCount = 0;
+            CheckContextDeleted(currContext);
+        }
     } else {
         LKDHASH_TEARDOWN(__GLXprocAddressHash,
                          __glXProcAddressHash, NULL, NULL, False);
+
+        /*
+         * It's possible that another thread could be blocked in a
+         * glXMakeCurrent call here, especially if an Xlib I/O error occurred.
+         * In that case, the other thead will be holding the context hash lock,
+         * so we'd deadlock if we tried to wait for it here. Instead, clean up
+         * if the lock is available, but don't try to wait if it isn't.
+         */
+        if (__glvndPthreadFuncs.mutex_trylock(&glxContextHashLock) == 0) {
+            HASH_ITER(hh, glxContextHash, currContext, currContextTemp) {
+                FreeContextInfo(currContext);
+            }
+            assert(glxContextHash == NULL);
+            __glvndPthreadFuncs.mutex_unlock(&glxContextHashLock);
+        }
     }
 }
 
