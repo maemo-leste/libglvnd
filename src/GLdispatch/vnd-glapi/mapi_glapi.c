@@ -122,12 +122,17 @@ _glapi_get_proc_address(const char *funcName)
 
 /**
  * Return the name of the function at the given dispatch offset.
- * This is only intended for debugging.
  */
 const char *
 _glapi_get_proc_name(unsigned int offset)
 {
    const struct mapi_stub *stub = stub_find_by_slot(offset);
    return stub ? stub_get_name(stub) : NULL;
+}
+
+
+int _glapi_get_stub_count(void)
+{
+    return stub_get_count();
 }
 

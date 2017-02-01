@@ -42,23 +42,23 @@
 #define MAPI_LAST_SLOT (MAPI_TABLE_NUM_STATIC + MAPI_TABLE_NUM_DYNAMIC - 1)
 
 struct mapi_stub {
-   /*!
-    * The name of a static stub function. This isn't really a pointer, it's an
-    * offset into public_string_pool.
-    */
-   const void *nameOffset;
+    /*!
+     * The name of the stub function.
+     */
+    const char *name;
 
-   int slot;
-   mapi_func addr;
+    int slot;
+    mapi_func addr;
 
-   /**
-    * The name of the function. This is only used for dynamic stubs. For static
-    * stubs, nameOffset is used instead.
-    */
-   char *nameBuffer;
+    /**
+     * A buffer to store the name of the function. This is only used for
+     * dynamic stubs. For static stubs, mapi_stub::name is a static
+     * string and mapi_stub::nameBuffer is NULL.
+     */
+    char *nameBuffer;
 };
 
-/* define public_string_pool and public_stubs */
+/* define public_stubs */
 #define MAPI_TMP_PUBLIC_STUBS
 #include "mapi_tmp.h"
 
@@ -69,7 +69,8 @@ stub_compare(const void *key, const void *elem)
    const struct mapi_stub *stub = (const struct mapi_stub *) elem;
    const char *stub_name;
 
-   stub_name = &public_string_pool[(unsigned long) stub->nameOffset];
+   // Skip the "gl" prefix.
+   stub_name = stub->name + 2;
 
    return strcmp(name, stub_name);
 }
@@ -80,10 +81,11 @@ stub_compare(const void *key, const void *elem)
 const struct mapi_stub *
 stub_find_public(const char *name)
 {
-   /* Public entry points are stored without their 'gl' prefix */
-   if (name[0] == 'g' && name[1] == 'l') {
-       name += 2;
-   }
+    // All of the function names start with "gl", so skip that prefix when
+    // comparing names.
+    if (name[0] == 'g' && name[1] == 'l') {
+        name += 2;
+    }
 
    return (const struct mapi_stub *) bsearch(name, public_stubs,
          ARRAY_SIZE(public_stubs), sizeof(public_stubs[0]), stub_compare);
@@ -133,7 +135,6 @@ stub_add_dynamic(const char *name)
        return NULL;
    }
 
-   stub->nameOffset = NULL;
    /* Assign the next unused slot. */
    stub->slot = MAPI_TABLE_NUM_STATIC + idx;
    stub->addr = entry_generate(stub->slot);
@@ -142,6 +143,7 @@ stub_add_dynamic(const char *name)
       stub->nameBuffer = NULL;
       return NULL;
    }
+   stub->name = stub->nameBuffer;
 
    num_dynamic_stubs = idx + 1;
 
@@ -163,7 +165,7 @@ stub_find_dynamic(const char *name, int generate)
 
    count = num_dynamic_stubs;
    for (i = 0; i < count; i++) {
-      if (strcmp(name, (const char *) dynamic_stubs[i].nameBuffer) == 0) {
+      if (strcmp(name, dynamic_stubs[i].name) == 0) {
          stub = &dynamic_stubs[i];
          break;
       }
@@ -176,28 +178,19 @@ stub_find_dynamic(const char *name, int generate)
    return stub;
 }
 
-static const struct mapi_stub *
-search_table_by_slot(const struct mapi_stub *table, size_t num_entries,
-                     int slot)
-{
-   size_t i;
-   for (i = 0; i < num_entries; ++i) {
-      if (table[i].slot == slot)
-         return &table[i];
-   }
-   return NULL;
-}
-
 const struct mapi_stub *
 stub_find_by_slot(int slot)
 {
-   const struct mapi_stub *stub =
-      search_table_by_slot(public_stubs, ARRAY_SIZE(public_stubs), slot);
-   if (stub)
-      return stub;
-   return search_table_by_slot(dynamic_stubs, num_dynamic_stubs, slot);
+    assert(slot >= 0);
+
+    if (slot < ARRAY_SIZE(public_stubs)) {
+        return &public_stubs[slot];
+    } else if (slot - ARRAY_SIZE(public_stubs) < num_dynamic_stubs) {
+        return &dynamic_stubs[slot - ARRAY_SIZE(public_stubs)];
+    } else {
+        return NULL;
+    }
 }
-#endif // !defined(STATIC_DISPATCH_ONLY)
 
 /**
  * Return the name of a stub.
@@ -205,17 +198,15 @@ stub_find_by_slot(int slot)
 const char *
 stub_get_name(const struct mapi_stub *stub)
 {
-   const char *name;
-
-   if (stub >= public_stubs &&
-       stub < public_stubs + ARRAY_SIZE(public_stubs)) {
-      name = &public_string_pool[(unsigned long) stub->nameOffset];
-   } else {
-      name = stub->nameBuffer;
-   }
-
-   return name;
+   return stub->name;
 }
+
+int stub_get_count(void)
+{
+    return ARRAY_SIZE(public_stubs) + num_dynamic_stubs;
+}
+
+#endif // !defined(STATIC_DISPATCH_ONLY)
 
 /**
  * Return the slot of a stub.

@@ -157,11 +157,12 @@ _glapi_get_proc_address(const char *funcName);
 const char *
 _glapi_get_proc_name(unsigned int offset);
 
-void
-_glapi_init_table_from_callback(struct _glapi_table *table,
-                                size_t entries,
-                                void *(*get_proc_addr)(const char *name, void *param),
-                                void *param);
+/**
+ * Returns the total number of defined stubs. This count only includes dynamic
+ * stubs that have been generated, so it will always be less than or equal to
+ * the size of the dispatch table.
+ */
+int _glapi_get_stub_count(void);
 
 /**
  * Functions used for patching entrypoints. These functions are exported from
