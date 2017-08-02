@@ -40,7 +40,8 @@
 #define USE_ASM (defined(USE_X86_ASM) ||    \
                  defined(USE_X86_64_ASM) || \
                  defined(USE_ARMV7_ASM) ||  \
-                 defined(USE_AARCH64_ASM))
+                 defined(USE_AARCH64_ASM) || \
+                 defined(USE_PPC64LE_ASM))
 
 #if defined(__GNUC__) && USE_ASM
 
@@ -63,6 +64,9 @@ static const int DISPATCH_FUNC_OFFSET_REL = 5;
 #elif defined(USE_X86_64_ASM)
 // For x86_64, the offset from the entrypoint to the dispatch function might be
 // more than 2^31, and there's no JMP instruction that takes a 64-bit offset.
+// Note that the same stub also works for an x32 build. In that case, though, a
+// pointer is only 32 bits, so we have to make sure we expand it a 64-bit value
+// when we patch it in SetDispatchFuncPointer.
 static unsigned char STUB_TEMPLATE[] =
 {
     0x48, 0xb8, 0xbd, 0xac, 0xcd, 0xab, 0x78, 0x56, 0x34, 0x12, // movabs 0x12345678abcdacbd,%rax
@@ -104,6 +108,24 @@ static const uint32_t STUB_TEMPLATE[] =
 };
 
 static const int DISPATCH_FUNC_OFFSET = 12;
+
+#elif defined(USE_PPC64LE_ASM)
+
+static uint32_t STUB_TEMPLATE[] =
+{
+    // NOTE!!!  NOTE!!!  NOTE!!!
+    // This data is endian-reversed from the code you would see in an assembly
+    // listing!
+    // 1000:
+    0xE98C0010,     //   ld 12, 9000f-1000b(12)
+    0x7D8903A6,     //   mtctr 12
+    0x4E800420,     //   bctr
+    0x60000000,     //   nop
+    // 9000:
+    0, 0            //   .quad 0
+};
+
+static const int DISPATCH_FUNC_OFFSET = sizeof(STUB_TEMPLATE) - 8;
 
 #else
 #error "Can't happen -- not implemented"
@@ -269,8 +291,11 @@ void SetDispatchFuncPointer(GLVNDGenEntrypoint *entry,
 
 #elif defined(USE_X86_64_ASM)
     // For x86_64, we have to use a movabs instruction, which needs the
-    // absolute address of the dispatch function.
-    *((GLVNDentrypointStub *) (code + DISPATCH_FUNC_OFFSET)) = dispatch;
+    // absolute address of the dispatch function. On an x32 build, pointers are
+    // 32 bits long, but the stub still uses a 64-bit address, so we cast it to
+    // a uint64_t value to make sure that we write a 64-bit value in both
+    // cases.
+    *((uint64_t *) (code + DISPATCH_FUNC_OFFSET)) = (uint64_t) ((uintptr_t) dispatch);
 
 #elif defined(USE_ARMV7_ASM)
     *((uint32_t *)(code + DISPATCH_FUNC_OFFSET)) = (uint32_t)dispatch;
@@ -287,6 +312,23 @@ void SetDispatchFuncPointer(GLVNDGenEntrypoint *entry,
     // See http://community.arm.com/groups/processors/blog/2010/02/17/caches-and-self-modifying-code
     __builtin___clear_cache((char *)entry->entrypointExec - 1,
                             (char *)entry->entrypointExec - 1 + sizeof(STUB_TEMPLATE));
+
+#elif defined(USE_PPC64LE_ASM)
+
+    // For PPC64LE, we need to patch in an absolute address.
+    *((uintptr_t *)(code + DISPATCH_FUNC_OFFSET)) = (uintptr_t)dispatch;
+
+    // This sequence is from the PowerISA Version 2.07B book.
+    // It may be a bigger hammer than we need, but it works;
+    // note that the __builtin___clear_cache intrinsic for
+    // PPC does not seem to generate any code.
+    __asm__ __volatile__(
+                         "  dcbst 0, %0\n\t"
+                         "  sync\n\t"
+                         "  icbi 0, %0\n\t"
+                         "  isync\n"
+                         : : "r" (code)
+                     );
 #else
 #error "Can't happen -- not implemented"
 #endif
