@@ -165,6 +165,10 @@ static EGLBoolean IsGbmDisplay(void *native_display)
         return EGL_FALSE;
     }
 
+    if (!info.dli_sname) {
+        return EGL_FALSE;
+    }
+
     return !strcmp(info.dli_sname, "gbm_create_device");
 }
 
@@ -194,6 +198,10 @@ static EGLBoolean IsWaylandDisplay(void *native_display)
     Dl_info info;
 
     if (dladdr(first_pointer, &info) == 0) {
+        return EGL_FALSE;
+    }
+
+    if (!info.dli_sname) {
         return EGL_FALSE;
     }
 
@@ -642,6 +650,15 @@ PUBLIC EGLBoolean EGLAPIENTRY eglMakeCurrent(EGLDisplay dpy,
 
     __eglEntrypointCommon();
 
+    // According to the EGL spec, the display handle must be valid, even if
+    // the context is NULL.
+    newDpy = __eglLookupDisplay(dpy);
+    if (newDpy == NULL) {
+        __eglReportError(EGL_BAD_DISPLAY, "eglMakeCurrent", NULL,
+                "Invalid display %p", dpy);
+        return EGL_FALSE;
+    }
+
     if (context == EGL_NO_CONTEXT && (draw != EGL_NO_SURFACE || read != EGL_NO_SURFACE)) {
         __eglReportError(EGL_BAD_MATCH, "eglMakeCurrent", NULL,
                 "Got an EGLSurface but no EGLContext");
@@ -691,15 +708,8 @@ PUBLIC EGLBoolean EGLAPIENTRY eglMakeCurrent(EGLDisplay dpy,
     }
 
     if (context != EGL_NO_CONTEXT) {
-        newDpy = __eglLookupDisplay(dpy);
-        if (newDpy == NULL) {
-            __eglReportError(EGL_BAD_DISPLAY, "eglMakeCurrent", NULL,
-                    "Invalid display %p", dpy);
-            return EGL_FALSE;
-        }
         newVendor = newDpy->vendor;
     } else {
-        newDpy = NULL;
         newVendor = NULL;
     }
 

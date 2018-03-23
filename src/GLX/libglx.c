@@ -53,6 +53,16 @@
 #define GLX_MINOR_VERSION 4
 #define GLX_VERSION_STRING "1.4"
 
+/*
+ * Older versions of glxproto.h contained a typo where "Attribs" was misspelled.
+ * The typo was fixed in the xorgproto version of glxproto.h, breaking the API.
+ * Work around that here.
+ */
+#if !defined(X_GLXCreateContextAttribsARB) && \
+    defined(X_GLXCreateContextAtrribsARB)
+#define X_GLXCreateContextAttribsARB X_GLXCreateContextAtrribsARB
+#endif
+
 static glvnd_mutex_t clientStringLock = GLVND_MUTEX_INITIALIZER;
 
 /**
@@ -259,6 +269,48 @@ PUBLIC GLXContext glXCreateNewContext(Display *dpy, GLXFBConfig config,
             context = NULL;
         }
     }
+    return context;
+}
+
+static GLXContext glXCreateContextAttribsARB(Display *dpy, GLXFBConfig config,
+        GLXContext share_list, Bool direct, const int *attrib_list)
+{
+    GLXContext context = NULL;
+    __GLXvendorInfo *vendor = NULL;
+
+    if (attrib_list != NULL) {
+        // See if the caller passed in a GLX_SCREEN attribute, and if so, use
+        // that to select a vendor library. This is needed for
+        // GLX_EXT_no_config_context, where we won't have a GLXFBConfig handle.
+        int i;
+        for (i=0; attrib_list[i] != None; i += 2) {
+            if (attrib_list[i] == GLX_SCREEN) {
+                int screen = attrib_list[i + 1];
+                vendor = __glXGetDynDispatch(dpy, screen);
+                if (vendor == NULL) {
+                    __glXSendError(dpy, BadValue, 0,
+                            X_GLXCreateContextAttribsARB, True);
+                    return None;
+                }
+            }
+        }
+    }
+
+    if (vendor == NULL) {
+        // We didn't get a GLX_SCREEN attribute, so look at the config instead.
+        vendor = CommonDispatchFBConfig(dpy, config, X_GLXCreateContextAttribsARB);
+    }
+
+    if (vendor != NULL && vendor->staticDispatch.createContextAttribsARB != NULL) {
+        context = vendor->staticDispatch.createContextAttribsARB(dpy, config, share_list, direct, attrib_list);
+        if (context != NULL) {
+            if (__glXAddVendorContextMapping(dpy, context, vendor) != 0) {
+                vendor->staticDispatch.destroyContext(dpy, context);
+                context = NULL;
+            }
+        }
+    }
+
     return context;
 }
 
@@ -1680,6 +1732,7 @@ const __GLXlocalDispatchFunction LOCAL_GLX_DISPATCH_FUNCTIONS[] =
 
         LOCAL_FUNC_TABLE_ENTRY(glXImportContextEXT)
         LOCAL_FUNC_TABLE_ENTRY(glXFreeContextEXT)
+        LOCAL_FUNC_TABLE_ENTRY(glXCreateContextAttribsARB)
 #undef LOCAL_FUNC_TABLE_ENTRY
     { NULL, NULL }
 };
