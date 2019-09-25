@@ -49,6 +49,9 @@ libEGL_la_CFLAGS =  -I$(srcdir)/$(UTHASH_DIR)
 libEGL_la_CFLAGS += -I$(srcdir)/$(UTIL_DIR)
 libEGL_la_CFLAGS += -I$(srcdir)/$(GL_DISPATCH_DIR)
 libEGL_la_CFLAGS += -I$(top_srcdir)/include
+if ENABLE_X11
+libEGL_la_CFLAGS += $(X11_CFLAGS)
+endif
 
 libEGL_la_CFLAGS += \
 	-DDEFAULT_EGL_VENDOR_CONFIG_DIRS=\"@sysconfdir@/glvnd/egl_vendor.d:@datadir@/glvnd/egl_vendor.d\"
@@ -106,3 +109,6 @@ g_egldispatchstubs.c : $(GENERATE_DEPS)
 g_egldispatchstubs.h : $(GENERATE_DEPS)
 	$(AM_V_GEN)$(PYTHON) $(GENERATE_DISPATCH_SCRIPT) header $(GENERATE_LIST_FILES) > $@
 endif
+
+pkgconfigdir = $(libdir)/pkgconfig
+pkgconfig_DATA = egl.pc

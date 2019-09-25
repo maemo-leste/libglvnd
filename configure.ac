@@ -2,7 +2,7 @@ dnl configure.ac
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.63])
-AC_INIT([libglvnd], [1.1.1], [kbrenneman@nvidia.com])
+AC_INIT([libglvnd], [1.2.0], [kbrenneman@nvidia.com])
 AC_CONFIG_SRCDIR([config.h.in])
 AC_CONFIG_HEADERS([config.h])
 
@@ -27,6 +27,7 @@ AC_PROG_LN_S
 AC_PROG_MAKE_SET
 AC_PROG_LIBTOOL
 AC_PROG_MKDIR_P
+PKG_PROG_PKG_CONFIG
 
 # The tarball from "make dist" already contains all of the generated files. If
 # we're building from that, then we won't need Python.
@@ -49,13 +50,25 @@ AC_ARG_ENABLE([egl],
 )
 AM_CONDITIONAL([ENABLE_EGL], [test "x$enable_egl" = "xyes"])
 
+AC_ARG_ENABLE([x11],
+    [AS_HELP_STRING([--disable-x11],
+        [Disable X11 support. Implies --disable-glx @<:@default=enabled@:>@])],
+    [enable_x11="$enableval"],
+    [enable_x11=yes]
+)
+AM_CONDITIONAL([ENABLE_X11], [test "x$enable_x11" = "xyes"])
+
 AC_ARG_ENABLE([glx],
     [AS_HELP_STRING([--disable-glx],
         [Disable GLX support @<:@default=enabled@:>@])],
     [enable_glx="$enableval"],
-    [enable_glx=yes]
+    [enable_glx="$enable_x11"]
 )
 AM_CONDITIONAL([ENABLE_GLX], [test "x$enable_glx" = "xyes"])
+
+if test "x$enable_x11" != "xyes" -a "x$enable_glx" = "xyes" ; then
+    AC_MSG_ERROR([Can't build GLX without X11.])
+fi
 
 AC_ARG_ENABLE([gles],
     [AS_HELP_STRING([--disable-gles],
@@ -64,6 +77,17 @@ AC_ARG_ENABLE([gles],
     [enable_gles=yes]
 )
 AM_CONDITIONAL([ENABLE_GLES], [test "x$enable_gles" = "xyes"])
+
+AC_ARG_ENABLE([headers],
+    [AS_HELP_STRING([--disable-headers],
+        [Do not install the GL/GLES/GLX/EGL header files @<:@default=enabled@:>@])],
+    [enable_headers="$enableval"],
+    [enable_headers=yes]
+)
+AM_CONDITIONAL([ENABLE_GL_HEADERS], [test "x$enable_headers" = "xyes"])
+AM_CONDITIONAL([ENABLE_EGL_HEADERS], [test "x$enable_headers" = "xyes" -a "x$enable_egl" = "xyes"])
+AM_CONDITIONAL([ENABLE_GLX_HEADERS], [test "x$enable_headers" = "xyes" -a "x$enable_glx" = "xyes"])
+AM_CONDITIONAL([ENABLE_GLES_HEADERS], [test "x$enable_headers" = "xyes" -a "x$enable_gles" = "xyes"])
 
 dnl
 dnl Arch/platform-specific settings. Copied from mesa
@@ -98,7 +122,7 @@ if test "x$enable_asm" = xyes; then
             ;;
         esac
         ;;
-    armv7*l)
+    armv7*l | armv8*l)
         asm_arch=armv7l
         ;;
     aarch64)
@@ -143,9 +167,19 @@ dnl
 dnl Checks for libraries.
 AX_PTHREAD()
 
-PKG_CHECK_MODULES([X11], [x11])
-PKG_CHECK_MODULES([XEXT], [xext])
-PKG_CHECK_MODULES([GLPROTO], [glproto])
+if test "x$enable_x11" = "xyes" ; then
+    PKG_CHECK_MODULES([X11], [x11])
+    AC_DEFINE([USE_X11], 1,
+        [Define to 1 if X11 support is enabled.])
+fi
+if test "x$enable_glx" = "xyes" ; then
+    PKG_CHECK_MODULES([XEXT], [xext])
+    PKG_CHECK_MODULES([GLPROTO], [glproto])
+fi
+
+AS_IF([test "x$gldispatch_use_tls" = "xyes"],
+      [AC_DEFINE([GLDISPATCH_USE_TLS], 1,
+      [Define to 1 if libGLdispatch should use a TLS variable for the dispatch table.])])
 
 dnl Checks for typedefs, structures, and compiler characteristics.
 AC_C_TYPEOF
@@ -296,10 +330,32 @@ AS_IF([test "x$HAVE_RTLD_NOLOAD" = "xyes"],
       [AC_DEFINE([HAVE_RTLD_NOLOAD], 1,
       [Define to 1 if the compiler supports RTLD_NOLOAD.])])
 
+AC_MSG_CHECKING([for dirent.d_type])
+AC_COMPILE_IFELSE([AC_LANG_SOURCE([
+#include <dirent.h>
+void foo(struct dirent *ent)
+{
+    (void) ent->d_type;
+}
+])],
+[HAVE_DIRENT_DTYPE=yes],[HAVE_DIRENT_DTYPE=no])
+AC_MSG_RESULT($HAVE_DIRENT_DTYPE)
+AS_IF([test "x$HAVE_DIRENT_DTYPE" = "xyes"],
+      [AC_DEFINE([HAVE_DIRENT_DTYPE], 1,
+      [Define to 1 if struct dirent has a d_type member.])])
+
+
 # See if the linker supports the --no-undefined flag.
 AX_CHECK_LINK_FLAG([-Xlinker --no-undefined],
       [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], ["-Xlinker --no-undefined"])],
       [AC_SUBST([LINKER_FLAG_NO_UNDEFINED], [""])])
+
+AC_ARG_VAR([GLDISPATCH_PAGE_SIZE],
+    [Page size to align static dispatch stubs])
+AS_IF([test "x$GLDISPATCH_PAGE_SIZE" != "x"],
+      [AC_DEFINE_UNQUOTED([GLDISPATCH_PAGE_SIZE], [$GLDISPATCH_PAGE_SIZE],
+      [Page size to align static dispatch stubs.])])
+
 
 dnl default CFLAGS
 CFLAGS="$CFLAGS -Wall -Werror -include config.h -fvisibility=hidden $DEFINES"
@@ -309,11 +365,17 @@ AC_CONFIG_FILES([Makefile
                  include/Makefile
                  src/Makefile
                  src/GL/Makefile
+                 src/GL/gl.pc
+                 src/OpenGL/opengl.pc
                  src/OpenGL/Makefile
+                 src/GLESv1/glesv1_cm.pc
                  src/GLESv1/Makefile
+                 src/GLESv2/glesv2.pc
                  src/GLESv2/Makefile
+                 src/GLX/glx.pc
                  src/GLX/Makefile
                  src/EGL/Makefile
+                 src/EGL/egl.pc
                  src/GLdispatch/Makefile
                  src/GLdispatch/vnd-glapi/Makefile
                  src/util/Makefile
