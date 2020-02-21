@@ -28,7 +28,7 @@
 project(
   'glvnd',
   'c',
-  version : '1.3.0',
+  version : '1.3.1',
   meson_version : '>= 0.48',
   default_options : ['c_std=gnu99']
 )
@@ -38,6 +38,9 @@ cc = meson.get_compiler('c')
 prog_py = import('python').find_installation()
 files_symbols_check = files('bin/symbols-check.py')
 prog_nm = find_program('nm')
+
+message('Host CPU family: @0@'.format(host_machine.cpu_family()))
+message('Host CPU: @0@'.format(host_machine.cpu()))
 
 with_asm = get_option('asm')
 use_asm = false
@@ -52,11 +55,32 @@ if not with_asm.disabled()
          'netbsd'].contains(host_machine.system()))
     add_project_arguments('-DUSE_X86_64_ASM', language : 'c')
   elif host_machine.cpu_family() == 'arm'
-    add_project_arguments('-DUSE_ARMV7_ASM', language : 'c')
+    # Try to figure out if we're targeting an ARMv7 or something older like
+    # armel. Note that host_machine.cpu() won't help here -- it might still
+    # return "armv7l" or "armv8l". Instead, try checking for compiler macros.
+    if ['gcc', 'clang'].contains(cc.get_id())
+      is_armv7 = cc.compiles('''
+#if !(defined(__ARM_ARCH_7__) \
+        || defined(__ARM_ARCH_7A__) \
+        || defined(__ARM_ARCH_7R__) \
+        || defined(__ARM_ARCH_7M__) \
+        || defined(__ARM_ARCH_7S__) \
+        || (defined(__ARM_ARCH) && __ARM_ARCH >= 7))
+#error "Not ARM7"
+#endif
+      ''', name : 'ARMv7 macros')
+    else
+      is_armv7 = true
+    endif
+    if is_armv7
+      add_project_arguments('-DUSE_ARMV7_ASM', language : 'c')
+    else
+      use_asm = false
+    endif
   elif host_machine.cpu_family() == 'aarch64'
     add_project_arguments('-DUSE_AARCH64_ASM', language : 'c')
-  elif host_machine.cpu_family() == 'ppc' and host_machine.endian() == 'little'
-    add_project_arguments('-DUSE_PPC64LE_ASM', language : 'c')
+  elif host_machine.cpu_family() == 'ppc64' and cc.get_define('_CALL_ELF') == '2'
+    add_project_arguments('-DUSE_PPC64_ASM', language : 'c')
   elif with_asm.enabled()
     error('No ASM available for @0@ (@1@ endian)'.format(host_machine.system(), host_machine.endian()))
   else
@@ -117,11 +141,11 @@ if use_asm
     gl_dispatch_type = 'armv7_tsd'
   elif host_machine.cpu_family() == 'aarch64'
     gl_dispatch_type = 'aarch64_tsd'
-  elif host_machine.cpu_family() == 'ppc64' and host_machine.endian() == 'little'
-    gl_dispatch_type = 'ppc64le_@1@'.format(have_tls ? 'tls' : 'tsd')
+  elif host_machine.cpu_family() == 'ppc64'
+    gl_dispatch_type = 'ppc64_@0@'.format(have_tls ? 'tls' : 'tsd')
   endif
 endif
-add_project_arguments('-DGLDISPATCH_TYPE_@0@'.format(gl_dispatch_type.to_upper()), language : ['c'])
+message('Using dispatch stub type: @0@'.format(gl_dispatch_type))
 
 if cc.has_function_attribute('constructor')
   add_project_arguments('-DUSE_ATTRIBUTE_CONSTRUCTOR', language : ['c'])
@@ -181,5 +205,12 @@ pkg.generate(
   name : 'libglvnd',
   description : 'Vendor-neutral OpenGL dispatch library vendor interface',
   version : meson.project_version(),
+  variables : [
+    # Drivers can use these to know where to install the JSON files to tell
+    # libglvnd to load them. Meson doesn't have a separate datarootdir option,
+    # so juse use datadir for both of these.
+    'datarootdir=${prefix}/' + get_option('datadir'),
+    'datadir=${prefix}/' + get_option('datadir'),
+  ]
 )
 
