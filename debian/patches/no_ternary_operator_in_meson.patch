@@ -1,0 +1,29 @@
+diff --git a/meson.build b/meson.build
+index 462f846..f9fa21f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -132,17 +132,22 @@ endif
+ 
+ gl_dispatch_type = 'pure_c'
+ if use_asm
++  if have_tls == 'tls'
++    t = 'tls'
++  else
++    t = 'tsd'
++  endif
+   if host_machine.cpu_family().startswith('x86')
+     gl_dispatch_type = '@0@_@1@'.format(
+       host_machine.cpu_family(),
+-      have_tls ? 'tls' : 'tsd',
++      t,
+     )
+   elif host_machine.cpu_family() == 'arm'
+     gl_dispatch_type = 'armv7_tsd'
+   elif host_machine.cpu_family() == 'aarch64'
+     gl_dispatch_type = 'aarch64_tsd'
+   elif host_machine.cpu_family() == 'ppc64'
+-    gl_dispatch_type = 'ppc64_@0@'.format(have_tls ? 'tls' : 'tsd')
++    gl_dispatch_type = 'ppc64_@0@'.format(t)
+   endif
+ endif
+ message('Using dispatch stub type: @0@'.format(gl_dispatch_type))
