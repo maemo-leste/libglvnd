@@ -2,7 +2,7 @@ dnl configure.ac
 dnl Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.63])
-AC_INIT([libglvnd], [1.3.1], [kbrenneman@nvidia.com])
+AC_INIT([libglvnd], [1.3.2], [kbrenneman@nvidia.com])
 AC_CONFIG_SRCDIR([config.h.in])
 AC_CONFIG_HEADERS([config.h])
 
@@ -29,6 +29,15 @@ AC_PROG_LIBTOOL
 AC_PROG_MKDIR_P
 PKG_PROG_PKG_CONFIG
 AC_PROG_NM
+
+AC_ARG_ENABLE([werror],
+    [AS_HELP_STRING([--enable-werror],
+        [Build with -Werror @<:@default=disabled@:>@])],
+    [enable_werror=$enableval],
+    [enable_werror=no])
+if test "x$enable_werror" = xyes; then
+    CFLAGS="$CFLAGS -Werror"
+fi
 
 # The tarball from "make dist" already contains all of the generated files. If
 # we're building from that, then we won't need Python.
@@ -380,7 +389,7 @@ AS_IF([test "x$GLDISPATCH_PAGE_SIZE" != "x"],
 DEFINES="$DEFINES -DEGL_NO_X11"
 
 dnl default CFLAGS
-CFLAGS="$CFLAGS -Wall -Werror -include config.h -fvisibility=hidden $DEFINES"
+CFLAGS="$CFLAGS -Wall -include config.h -fvisibility=hidden $DEFINES"
 
 AC_CONFIG_FILES([Makefile
                  libglvnd.pc
